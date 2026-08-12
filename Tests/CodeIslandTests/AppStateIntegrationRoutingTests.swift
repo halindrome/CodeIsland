@@ -22,7 +22,7 @@ final class AppStateIntegrationRoutingTests: XCTestCase {
 
         // A question from another session occupies the question queue, so the
         // question that arrives in step 3 will not reassign the surface.
-        _ = Task<Data, Never> {
+        let cTask = Task<Data, Never> {
             await withCheckedContinuation { appState.handleQuestion(try! self.question("s-c"), continuation: $0) }
         }
         await Task.yield()
@@ -33,22 +33,27 @@ final class AppStateIntegrationRoutingTests: XCTestCase {
         await Task.yield()
         XCTAssertEqual(appState.surface, .approvalCard(sessionId: "s-a"))
 
-        _ = Task<Data, Never> {
+        let bTask = Task<Data, Never> {
             await withCheckedContinuation { appState.handlePermissionRequest(try! self.perm("s-b", "Read"), continuation: $0) }
         }
         await Task.yield()
 
         // A question for s-a drains s-a's permission. s-b's is untouched, so the
         // queue is still non-empty while s-a's card has nothing behind it.
-        _ = Task<Data, Never> {
+        let aQuestionTask = Task<Data, Never> {
             await withCheckedContinuation { appState.handleQuestion(try! self.question("s-a"), continuation: $0) }
         }
         await Task.yield()
         _ = await aTask.value
-        XCTAssertNil(appState.pendingPermission(forSession: "s-a"), "test models a card with no backing request")
-        XCTAssertFalse(appState.permissionQueue.isEmpty, "and another session still queued behind it")
+        XCTAssertNil(appState.pendingPermission(forSession: "s-a"), "s-a's request is gone")
+        XCTAssertFalse(appState.permissionQueue.isEmpty, "and another session is still queued behind it")
+        XCTAssertNotEqual(
+            appState.surface,
+            .approvalCard(sessionId: "s-a"),
+            "the drain must not leave the island expanded on a card that renders nothing"
+        )
 
-        _ = Task<Data, Never> {
+        let dTask = Task<Data, Never> {
             await withCheckedContinuation { appState.handlePermissionRequest(try! self.perm("s-d", "Edit"), continuation: $0) }
         }
         await Task.yield()
@@ -63,6 +68,17 @@ final class AppStateIntegrationRoutingTests: XCTestCase {
             .approvalCard(sessionId: "s-b"),
             "the panel must move to the queued request that is actually waiting"
         )
+
+        // Resolve the remaining waiters: an unresumed CheckedContinuation is a
+        // runtime misuse warning, and the noise hides real ones.
+        appState.handlePeerDisconnect(sessionId: "s-b")
+        appState.handlePeerDisconnect(sessionId: "s-d")
+        appState.handlePeerDisconnect(sessionId: "s-c")
+        appState.handlePeerDisconnect(sessionId: "s-a")
+        _ = await bTask.value
+        _ = await dTask.value
+        _ = await cTask.value
+        _ = await aQuestionTask.value
     }
 
     /// The routing half, exercised on the card the gate just raised: acting on
@@ -151,15 +167,59 @@ final class AppStateIntegrationRoutingTests: XCTestCase {
         _ = await replayTask.value
     }
 
+    /// The other side of the moved un-dismiss: `mergeDuplicatePermissionRequest`
+    /// returns false when the tool inputs differ (#169 — parallel tool calls can
+    /// share an id), so that request DOES enqueue and must still clear the
+    /// dismissal. Moving the un-dismiss must not strand a session as dismissed.
+    func testSameToolUseIdWithDifferentInputStillClearsTheDismissal() async throws {
+        let appState = AppState()
+
+        let firstTask = Task<Data, Never> {
+            await withCheckedContinuation {
+                appState.handlePermissionRequest(try! self.permWithToolUse("s-parallel", "Read", "tool-9"), continuation: $0)
+            }
+        }
+        await Task.yield()
+        appState.dismissPermissionPrompt(expectedSessionId: "s-parallel")
+        XCTAssertEqual(appState.surface, .collapsed)
+
+        // Same tool_use_id, different input: a distinct request, not a replay.
+        let secondTask = Task<Data, Never> {
+            await withCheckedContinuation {
+                appState.handlePermissionRequest(
+                    try! self.permWithToolUse("s-parallel", "Read", "tool-9", command: "echo different"),
+                    continuation: $0
+                )
+            }
+        }
+        await Task.yield()
+
+        XCTAssertEqual(appState.permissionQueue.count, 2, "differing inputs must enqueue, not merge")
+        XCTAssertEqual(
+            appState.surface,
+            .approvalCard(sessionId: "s-parallel"),
+            "a genuinely new request must clear the dismissal and bring the card back"
+        )
+
+        appState.handlePeerDisconnect(sessionId: "s-parallel")
+        _ = await firstTask.value
+        _ = await secondTask.value
+    }
+
     // MARK: - Helpers
 
-    private func permWithToolUse(_ sessionId: String, _ toolName: String, _ toolUseId: String) throws -> HookEvent {
+    private func permWithToolUse(
+        _ sessionId: String,
+        _ toolName: String,
+        _ toolUseId: String,
+        command: String = "echo test"
+    ) throws -> HookEvent {
         try XCTUnwrap(HookEvent(from: try JSONSerialization.data(withJSONObject: [
             "hook_event_name": "PermissionRequest",
             "session_id": sessionId,
             "tool_name": toolName,
             "tool_use_id": toolUseId,
-            "tool_input": ["command": "echo test"],
+            "tool_input": ["command": command],
         ])))
     }
 

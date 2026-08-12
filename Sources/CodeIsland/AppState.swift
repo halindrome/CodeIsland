@@ -2057,6 +2057,12 @@ final class AppState {
             item.continuation.resume(returning: denyResponse)
             return true
         }
+        // Every drain path routes through here, so this is the one place that
+        // can guarantee a card is never left rendering a request that no longer
+        // exists. `handlePeerDisconnect` reaches showNextPending() on its own,
+        // but the question paths do not, and an .approvalCard whose session was
+        // just drained renders nothing at all — an expanded, empty island.
+        collapseStaleCardSurface()
     }
 
     /// Called when the bridge socket disconnects — the question/permission was answered externally (e.g. user replied in terminal)

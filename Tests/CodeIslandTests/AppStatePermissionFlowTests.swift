@@ -714,9 +714,11 @@ final class AppStatePermissionFlowTests: XCTestCase {
         // B queues behind A's card rather than stealing it — but it must not be
         // lost: as A's requests clear, B's card has to come up.
         XCTAssertEqual(appState.permissionQueue.count, 3)
-        // Routed by session (#308) rather than by queue position, so this also
-        // covers the two fixes meeting: the gate raised A's card, and approving
-        // it must resolve A's requests specifically.
+        // Routed by session (#308) rather than by queue position. Both of A's
+        // requests are at the front here, so this does not by itself prove the
+        // routing picked the right index — the session-list case in
+        // AppStateIntegrationRoutingTests is what covers that. It does keep this
+        // test honest about which session it means to approve.
         appState.approvePermission(expectedSessionId: "s-a")
         appState.approvePermission(expectedSessionId: "s-a")
         _ = await firstATask.value
