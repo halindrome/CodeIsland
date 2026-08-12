@@ -532,6 +532,203 @@ final class AppStatePermissionFlowTests: XCTestCase {
         try String(contentsOf: codeIslandRulesPath(in: codexHome), encoding: .utf8)
     }
 
+    /// #309 — a dismissed request stays queued so the CLI stays blocked, which
+    /// used to make `permissionQueue.count == 1` false forever and swallow every
+    /// later request, from every session, with no card and no sound.
+    func testDismissedPermissionDoesNotSilenceALaterSessionsRequest() async throws {
+        let appState = AppState()
+        let dismissed = try makePermissionRequestEvent(sessionId: "s-dismissed", toolName: "Bash")
+        let later = try makePermissionRequestEvent(sessionId: "s-later", toolName: "Edit")
+
+        let dismissedTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(dismissed, continuation: continuation)
+            }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.surface, .approvalCard(sessionId: "s-dismissed"))
+
+        appState.dismissPermissionPrompt()
+        XCTAssertEqual(appState.surface, .collapsed)
+        XCTAssertEqual(appState.permissionQueue.count, 1, "dismiss must keep the request queued")
+
+        let laterTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(later, continuation: continuation)
+            }
+        }
+        await Task.yield()
+
+        XCTAssertEqual(
+            appState.surface,
+            .approvalCard(sessionId: "s-later"),
+            "a different session's approval must still raise a card while a dismissed one sits in the queue"
+        )
+        // Stop here on failure: under the bug, approvePermission() below resolves
+        // the dismissed request instead, so `await laterTask.value` would hang
+        // and the test would report as a timeout rather than by name. The head
+        // check matters as much as the surface one — an implementation that
+        // points the card at this session by hand shows "s-later" while the
+        // dismissed request still leads the queue, so the surface assertion
+        // alone passes and the await still hangs.
+        XCTAssertEqual(
+            appState.permissionQueue.first?.event.sessionId,
+            "s-later",
+            "the card on screen must be backed by the head of the queue, which is what approve resolves"
+        )
+        guard appState.surface == .approvalCard(sessionId: "s-later"),
+              appState.permissionQueue.first?.event.sessionId == "s-later" else {
+            appState.handlePeerDisconnect(sessionId: "s-dismissed")
+            appState.handlePeerDisconnect(sessionId: "s-later")
+            _ = await dismissedTask.value
+            _ = await laterTask.value
+            return
+        }
+
+        appState.approvePermission()
+        let laterResponse = await laterTask.value
+        XCTAssertEqual(try extractPermissionBehavior(from: laterResponse), "allow")
+
+        await assertTaskNotResolved(dismissedTask)
+        appState.handlePeerDisconnect(sessionId: "s-dismissed")
+        _ = await dismissedTask.value
+    }
+
+    /// A dismissal is cleared by that session's NEXT request arriving
+    /// (`handlePermissionRequest` removes it from `dismissedPermissionSessionIds`
+    /// on entry — "session needs user decision again"), not by the dismissed
+    /// request resolving. So the session's next request must bring its card back.
+    ///
+    /// This is also the state that silenced everything else: the un-dismiss makes
+    /// the still-queued earlier request count as visible while nothing is on
+    /// screen, so a queue-derived "is a card showing" proxy reads true forever.
+    func testDismissedSessionsNextRequestReRaisesItsCard() async throws {
+        let appState = AppState()
+        let first = try makePermissionRequestEvent(sessionId: "s-same", toolName: "Bash")
+        let second = try makePermissionRequestEvent(sessionId: "s-same", toolName: "Edit")
+
+        let firstTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(first, continuation: continuation)
+            }
+        }
+        await Task.yield()
+        appState.dismissPermissionPrompt()
+        XCTAssertEqual(appState.surface, .collapsed)
+
+        let secondTask = Task<Data, Never> {
+            await withCheckedContinuation { continuation in
+                appState.handlePermissionRequest(second, continuation: continuation)
+            }
+        }
+        await Task.yield()
+
+        XCTAssertEqual(
+            appState.surface,
+            .approvalCard(sessionId: "s-same"),
+            "the session un-dismissed itself by asking again, so its card must come back"
+        )
+        XCTAssertEqual(appState.permissionQueue.count, 2)
+        // Pins queue order, not the promotion mechanism: the card renders the
+        // head, so the user is asked about the earlier request rather than the
+        // one that just arrived. Both requests here are from one session, so no
+        // assertion at this level can tell showNextPending's promotion from a
+        // hand-pointed surface — the cross-session test's head check is what
+        // covers that.
+        XCTAssertEqual(
+            appState.pendingPermission?.event.toolName,
+            "Bash",
+            "the card must show the earlier queued request, not the one that just arrived"
+        )
+
+        appState.handlePeerDisconnect(sessionId: "s-same")
+        _ = await firstTask.value
+        _ = await secondTask.value
+    }
+
+    /// `drainPermissions` (process exit, or a question arriving for the session)
+    /// empties the queue without clearing `surface`, and the card renders nothing
+    /// when there is no head request. A gate that trusts `.approvalCard` alone
+    /// would block on that phantom card and swallow the next request.
+    func testRequestArrivingUnderAStaleApprovalSurfaceStillRaisesACard() async throws {
+        let appState = AppState()
+
+        // The phantom state itself: an .approvalCard surface with an empty queue.
+        // Production reaches it through the drainPermissions callers that do not
+        // touch `surface` (process exit; a question arriving for the session).
+        // Set here directly because those callers are private.
+        appState.surface = .approvalCard(sessionId: "s-gone")
+        XCTAssertTrue(appState.permissionQueue.isEmpty)
+
+        let next = try makePermissionRequestEvent(sessionId: "s-next", toolName: "Read")
+        let nextTask = Task<Data, Never> {
+            await withCheckedContinuation { appState.handlePermissionRequest(next, continuation: $0) }
+        }
+        await Task.yield()
+
+        XCTAssertEqual(
+            appState.surface,
+            .approvalCard(sessionId: "s-next"),
+            "a phantom card must not block the next request from being shown"
+        )
+
+        appState.approvePermission()
+        let response = await nextTask.value
+        XCTAssertEqual(try extractPermissionBehavior(from: response), "allow")
+    }
+
+    /// The state F1 described: a dismissed session asking again must not leave
+    /// the panel silent for everyone else.
+    func testDismissedSessionAskingAgainDoesNotSilenceOtherSessions() async throws {
+        let appState = AppState()
+        let firstA = try makePermissionRequestEvent(sessionId: "s-a", toolName: "Bash")
+        let secondA = try makePermissionRequestEvent(sessionId: "s-a", toolName: "Edit")
+        let fromB = try makePermissionRequestEvent(sessionId: "s-b", toolName: "Read")
+
+        let firstATask = Task<Data, Never> {
+            await withCheckedContinuation { appState.handlePermissionRequest(firstA, continuation: $0) }
+        }
+        await Task.yield()
+        appState.dismissPermissionPrompt()
+
+        let secondATask = Task<Data, Never> {
+            await withCheckedContinuation { appState.handlePermissionRequest(secondA, continuation: $0) }
+        }
+        await Task.yield()
+
+        let fromBTask = Task<Data, Never> {
+            await withCheckedContinuation { appState.handlePermissionRequest(fromB, continuation: $0) }
+        }
+        await Task.yield()
+
+        // The panel must be showing *something* — under the incomplete gate the
+        // un-dismiss left A's card unopened and B arrived to a silent, collapsed
+        // panel. (Without this the rest of the test passes either way, because
+        // resolving A's requests surfaces B regardless.)
+        XCTAssertEqual(
+            appState.surface,
+            .approvalCard(sessionId: "s-a"),
+            "A's card must be up — a silent collapsed panel is the bug, and it must be A's card since A's request leads the queue"
+        )
+
+        // B queues behind A's card rather than stealing it — but it must not be
+        // lost: as A's requests clear, B's card has to come up.
+        XCTAssertEqual(appState.permissionQueue.count, 3)
+        appState.approvePermission()
+        appState.approvePermission()
+        _ = await firstATask.value
+        _ = await secondATask.value
+
+        XCTAssertEqual(
+            appState.surface,
+            .approvalCard(sessionId: "s-b"),
+            "B's request must surface once A's are resolved, not sit silently forever"
+        )
+        appState.approvePermission()
+        let bResponse = await fromBTask.value
+        XCTAssertEqual(try extractPermissionBehavior(from: bResponse), "allow")
+    }
+
     private func makePermissionRequestEvent(
         sessionId: String,
         toolName: String,
