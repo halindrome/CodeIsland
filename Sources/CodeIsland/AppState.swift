@@ -1308,9 +1308,6 @@ final class AppState {
             return
         }
 
-        // New incoming permission request means session needs user decision again.
-        dismissedPermissionSessionIds.remove(sessionId)
-
         // Clear any pending questions for THIS session (mutually exclusive within a session)
         drainQuestions(forSession: sessionId, reason: "newPermissionRequest")
 
@@ -1331,6 +1328,14 @@ final class AppState {
             return
         }
 
+        // A genuinely new request means this session needs a user decision again,
+        // so it stops being dismissed. This must come AFTER the replay-dedup
+        // return above: a replay is the same decision arriving twice, not a new
+        // one, and un-dismissing on a replay resurrects the hidden request —
+        // which then suppresses the next session's sound and can put the
+        // resurrected session's card on screen instead of the arriving one.
+        dismissedPermissionSessionIds.remove(sessionId)
+
         // Dismissing hides a request but deliberately leaves it queued, so the
         // CLI stays blocked and the prompt stays recoverable. Gating on
         // `permissionQueue.count == 1` therefore swallowed every later request —
@@ -1347,12 +1352,18 @@ final class AppState {
         // it. That is pre-existing (`main` behaves the same) and needs
         // showNextPending to skip un-openable entries; tracked separately.
         //
-        // The surface alone is not enough either: `drainPermissions` empties the
-        // queue without clearing `surface`, and the card renders nothing when
-        // there is no head request — so a bare `.approvalCard` check would block
-        // on a card that is not actually there. Both halves are required.
+        // The surface alone is not enough either: `drainPermissions` empties one
+        // SESSION's requests without clearing `surface`, and a card renders
+        // nothing when its own session has no queued request — so a bare
+        // `.approvalCard` check would block on a card that is not actually
+        // there. Ask exactly what the card asks: is this session's request
+        // still queued? A whole-queue test (`!permissionQueue.isEmpty`) gets
+        // this wrong whenever another session still has one, which also
+        // suppresses the stale-card collapse inside showNextPending() and
+        // wedges the panel behind a dead card. (#308 + #309)
         let approvalCardOnScreen: Bool
-        if case .approvalCard = surface, !permissionQueue.isEmpty {
+        if case .approvalCard(let shownSessionId) = surface,
+           pendingPermission(forSession: shownSessionId) != nil {
             approvalCardOnScreen = true
         } else {
             approvalCardOnScreen = false

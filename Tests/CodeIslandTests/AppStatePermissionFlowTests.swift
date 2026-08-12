@@ -714,8 +714,11 @@ final class AppStatePermissionFlowTests: XCTestCase {
         // B queues behind A's card rather than stealing it — but it must not be
         // lost: as A's requests clear, B's card has to come up.
         XCTAssertEqual(appState.permissionQueue.count, 3)
-        appState.approvePermission()
-        appState.approvePermission()
+        // Routed by session (#308) rather than by queue position, so this also
+        // covers the two fixes meeting: the gate raised A's card, and approving
+        // it must resolve A's requests specifically.
+        appState.approvePermission(expectedSessionId: "s-a")
+        appState.approvePermission(expectedSessionId: "s-a")
         _ = await firstATask.value
         _ = await secondATask.value
 
