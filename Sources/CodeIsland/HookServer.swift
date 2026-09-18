@@ -762,7 +762,7 @@ class HookServer {
 
             // AskUserQuestion is a question, not a permission — route to QuestionBar
             if event.toolName == "AskUserQuestion" {
-                monitorPeerDisconnect(connection: connection, sessionId: sessionId)
+                monitorPeerDisconnect(connection: connection, sessionId: sessionId, agentId: event.agentId)
                 Task {
                     let responseBody = await withCheckedContinuation { continuation in
                         appState.handleAskUserQuestion(event, continuation: continuation)
@@ -777,7 +777,7 @@ class HookServer {
                 return
             }
 
-            monitorPeerDisconnect(connection: connection, sessionId: sessionId)
+            monitorPeerDisconnect(connection: connection, sessionId: sessionId, agentId: event.agentId)
             Task {
                 let responseBody = await withCheckedContinuation { continuation in
                     appState.handlePermissionRequest(event, continuation: continuation)
@@ -787,7 +787,7 @@ class HookServer {
 
         case .question:
             let questionSessionId = event.sessionId ?? "default"
-            monitorPeerDisconnect(connection: connection, sessionId: questionSessionId)
+            monitorPeerDisconnect(connection: connection, sessionId: questionSessionId, agentId: event.agentId)
             Task {
                 let responseBody = await withCheckedContinuation { continuation in
                     appState.handleQuestion(event, continuation: continuation)
@@ -820,7 +820,7 @@ class HookServer {
     /// That caused every PermissionRequest to be auto-drained as `deny` before the UI
     /// card was even visible. We now rely on `stateUpdateHandler` transitioning to
     /// `cancelled`/`failed` — which only happens on real socket teardown, not half-close.
-    private func monitorPeerDisconnect(connection: NWConnection, sessionId: String) {
+    private func monitorPeerDisconnect(connection: NWConnection, sessionId: String, agentId: String?) {
         let context = ConnectionContext()
         let connId = ObjectIdentifier(connection)
         connectionContexts[connId] = context
@@ -831,7 +831,7 @@ class HookServer {
                 switch state {
                 case .cancelled, .failed:
                     if !context.responded {
-                        self.appState.handlePeerDisconnect(sessionId: sessionId)
+                        self.appState.handlePeerDisconnect(sessionId: sessionId, agentId: agentId)
                     }
                     self.connectionContexts.removeValue(forKey: connId)
                 default:

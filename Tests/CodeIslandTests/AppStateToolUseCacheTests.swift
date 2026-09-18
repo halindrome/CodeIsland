@@ -357,6 +357,105 @@ final class AppStateToolUseCacheTests: XCTestCase {
         XCTAssertEqual(try behavior(response), "allow")
     }
 
+    /// A background subagent shares its parent's session_id. Its PostToolUse /
+    /// SubagentStop arriving while the main thread's AskUserQuestion is on screen
+    /// used to blanket-drain the question, so Claude saw "Permission denied by hook".
+    /// The main thread's own PostToolUse (answered in the terminal) still drains it.
+    func testSubagentActivityDoesNotDenyMainThreadQuestion() async throws {
+        let appState = AppState()
+        let ask = try makeRawHookEvent([
+            "hook_event_name": "PermissionRequest",
+            "session_id": "s1",
+            "tool_name": "AskUserQuestion",
+            "tool_input": ["questions": [["question": "Fix it?", "options": [["label": "Yes"], ["label": "No"]]]]],
+        ])
+        let responseTask = Task<Data, Never> {
+            await withCheckedContinuation { appState.handleAskUserQuestion(ask, continuation: $0) }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.questionQueue.count, 1)
+
+        for name in ["PostToolUse", "SubagentStop"] {
+            appState.handleEvent(try makeRawHookEvent([
+                "hook_event_name": name,
+                "session_id": "s1",
+                "agent_id": "bg-agent",
+                "tool_name": "Bash",
+                "tool_use_id": "toolu_bg_\(name)",
+            ]))
+        }
+        XCTAssertEqual(appState.questionQueue.count, 1, "subagent activity must not drain the parent's question")
+        await assertTaskNotResolved(responseTask)
+
+        appState.handleEvent(try makeHookEvent(name: "PostToolUse", sessionId: "s1", toolName: "AskUserQuestion", toolUseId: "toolu_ask"))
+        XCTAssertTrue(appState.questionQueue.isEmpty, "main-thread activity still means the question was answered elsewhere")
+        _ = await responseTask.value
+    }
+
+    /// The other per-session drains had the same blind spot: a subagent's new
+    /// permission request, its own question, or its hook socket dropping each
+    /// denied the main thread's pending question.
+    func testSubagentRequestsAndDisconnectsDoNotDenyMainThreadQuestion() async throws {
+        let appState = AppState()
+        let mainResponse = Task<Data, Never> {
+            await withCheckedContinuation {
+                appState.handleAskUserQuestion(try! self.makeAskEvent(agentId: nil), continuation: $0)
+            }
+        }
+        await Task.yield()
+
+        let subPermission = Task<Data, Never> {
+            await withCheckedContinuation {
+                appState.handlePermissionRequest(try! self.makeRawHookEvent([
+                    "hook_event_name": "PermissionRequest",
+                    "session_id": "s1",
+                    "agent_id": "bg-agent",
+                    "tool_name": "Bash",
+                    "tool_use_id": "toolu_sub_bash",
+                ]), continuation: $0)
+            }
+        }
+        await Task.yield()
+        XCTAssertEqual(appState.questionQueue.map(\.event.agentId), [nil], "a subagent's permission request must not deny the parent's question")
+        XCTAssertEqual(appState.permissionQueue.count, 1)
+
+        let subQuestion = Task<Data, Never> {
+            await withCheckedContinuation {
+                appState.handleAskUserQuestion(try! self.makeAskEvent(agentId: "bg-agent"), continuation: $0)
+            }
+        }
+        await Task.yield()
+
+        // A new question from the subagent still supersedes that subagent's own
+        // permission request, but leaves the parent's question alone.
+        _ = await subPermission.value
+        XCTAssertTrue(appState.permissionQueue.isEmpty)
+        XCTAssertEqual(appState.questionQueue.map(\.event.agentId), [nil, "bg-agent"])
+        await assertTaskNotResolved(mainResponse)
+
+        // The subagent's hook socket drops: only its own request goes.
+        appState.handlePeerDisconnect(sessionId: "s1", agentId: "bg-agent")
+        _ = await subQuestion.value
+        XCTAssertEqual(appState.questionQueue.map(\.event.agentId), [nil])
+        XCTAssertEqual(appState.sessions["s1"]?.status, .waitingQuestion)
+        await assertTaskNotResolved(mainResponse)
+
+        appState.handlePeerDisconnect(sessionId: "s1")
+        _ = await mainResponse.value
+        XCTAssertTrue(appState.questionQueue.isEmpty)
+    }
+
+    private func makeAskEvent(agentId: String?) throws -> HookEvent {
+        var payload: [String: Any] = [
+            "hook_event_name": "PermissionRequest",
+            "session_id": "s1",
+            "tool_name": "AskUserQuestion",
+            "tool_input": ["questions": [["question": "Fix it?", "options": [["label": "Yes"], ["label": "No"]]]]],
+        ]
+        if let agentId { payload["agent_id"] = agentId }
+        return try makeRawHookEvent(payload)
+    }
+
     func testTraePostToolUseKeepsQueuedPermissionUntilUserResponds() async throws {
         let appState = AppState()
         let pending = try makePermissionEvent(
