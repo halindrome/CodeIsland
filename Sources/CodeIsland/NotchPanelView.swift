@@ -2041,8 +2041,12 @@ private struct SessionListView: View {
     @AppStorage(SettingsKey.showClaudeQuota) private var showClaudeQuota = SettingsDefaults.showClaudeQuota
 
     private var groupedSessions: [(header: String, source: String?, ids: [String])] {
-        if let only = onlySessionId, appState.sessions[only] != nil {
-            return [("", nil, [only])]
+        if let only = onlySessionId {
+            // A card whose session is gone shows nothing (the AiWork
+            // watchers drop sessions without moving the surface). Falling
+            // through would render every session as a completion card, and
+            // their replies size against each other without settling (#357).
+            return appState.sessions[only] != nil ? [("", nil, [only])] : []
         }
 
         let sorted = appState.sessions.keys.sorted()

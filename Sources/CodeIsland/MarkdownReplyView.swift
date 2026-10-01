@@ -1,6 +1,9 @@
 import AppKit
 import CodeIslandCore
+import OSLog
 import SwiftUI
+
+private let log = Logger(subsystem: "com.codeisland", category: "CompletionReply")
 
 // MARK: - Entry point
 
@@ -50,6 +53,7 @@ private struct CompletionReplyView: View {
     /// This view's own laid-out height, so the rest of the card can be told
     /// apart from it in the panel's measured height.
     @State private var replyHeight: CGFloat = 0
+    @State private var refits = CompletionReplyRefitLimiter()
 
     var body: some View {
         let maxHeight = CompletionReplyMetrics.maxHeight(
@@ -73,7 +77,19 @@ private struct CompletionReplyView: View {
         // hugs a short reply and stops growing at maxHeight.
         .frame(maxHeight: maxHeight)
         .fixedSize(horizontal: false, vertical: true)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { replyHeight = $0 }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
+            // replyHeight feeds back into maxHeight. Two replies sharing the
+            // panel's measurement can chase each other without settling, so
+            // past a few re-fits a second the height stops feeding back (#357).
+            // ponytail: after a trip the cap stays as it was until the next
+            // geometry change; make maxHeight independent of replyHeight if
+            // that ever shows (it needs the chrome measured on its own).
+            if refits.allows(at: Date()) {
+                replyHeight = height
+            } else if refits.justTripped {
+                log.error("completion reply re-fit loop stopped at \(height, privacy: .public)pt (panel \(space?.panelHeight ?? 0, privacy: .public)pt)")
+            }
+        }
         .scrollIndicatorsFlash(onAppear: true)
         .tint(IslandMarkdownStyle.link)
     }
@@ -95,6 +111,29 @@ final class CompletionCardSpace {
 
     func recordPanelHeight(_ height: CGFloat) {
         if panelHeight != height { panelHeight = height }
+    }
+}
+
+/// Caps how often a completion reply re-fits itself to its measured
+/// height. Settling takes two or three re-fits; a feedback loop takes
+/// thousands a second. A class, so counting doesn't invalidate the view.
+final class CompletionReplyRefitLimiter {
+    static let maxRefits = 8
+    static let window: TimeInterval = 1
+
+    private var windowStart = Date.distantPast
+    private var count = 0
+    /// True on the first refused re-fit of a window, for logging once.
+    private(set) var justTripped = false
+
+    func allows(at now: Date) -> Bool {
+        if now.timeIntervalSince(windowStart) >= Self.window {
+            windowStart = now
+            count = 0
+        }
+        count += 1
+        justTripped = count == Self.maxRefits + 1
+        return count <= Self.maxRefits
     }
 }
 

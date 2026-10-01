@@ -121,6 +121,19 @@ final class MarkdownReplyViewTests: XCTestCase {
         )
     }
 
+    func testReplyStopsRefittingWhenItRefitsTooOftenAndRecoversLater() {
+        let limiter = CompletionReplyRefitLimiter()
+        let start = Date()
+        for i in 0..<CompletionReplyRefitLimiter.maxRefits {
+            XCTAssertTrue(limiter.allows(at: start.addingTimeInterval(Double(i) * 0.01)))
+        }
+        XCTAssertFalse(limiter.allows(at: start.addingTimeInterval(0.5)), "a loop's next re-fit is refused")
+        XCTAssertTrue(limiter.justTripped, "the first refusal is the one that gets logged")
+        XCTAssertFalse(limiter.allows(at: start.addingTimeInterval(0.6)))
+        XCTAssertFalse(limiter.justTripped)
+        XCTAssertTrue(limiter.allows(at: start.addingTimeInterval(1.5)), "a later change re-fits again")
+    }
+
     func testOlderRepliesOnTheCompletionCardTakeOneOrTwoLines() {
         XCTAssertEqual(CompletionReplyMetrics.olderReplyLineLimit(1), 1)
         XCTAssertEqual(CompletionReplyMetrics.olderReplyLineLimit(2), 2)

@@ -65,6 +65,23 @@ final class CompletionCardLayoutTests: XCTestCase {
         XCTAssertGreaterThan(gap, 0, "the card's bottom edge is cut by the window")
     }
 
+    func testCardOfAMissingSessionShowsNoSessions() throws {
+        // The AiWork watchers drop sessions without moving the surface off
+        // their card. Such a card used to fall back to every session as a
+        // completion card, and two completion replies size against each
+        // other without settling (#357).
+        let state = state(tasks: false, recap: false, secondSession: true)
+        state.surface = .completionCard(sessionId: "gone")
+        let empty = AppState()
+        empty.surface = .completionCard(sessionId: "gone")
+
+        // Only the "N sessions" link may separate it from an empty panel;
+        // any session card is taller than that.
+        let gap = try gapUnderPanel(state, notchHeight: 32)
+        XCTAssertGreaterThan(gap, try gapUnderPanel(empty, notchHeight: 32) - 50,
+                             "a card whose session is gone still renders other sessions")
+    }
+
     // MARK: - Fixture
 
     private func state(tasks: Bool, recap: Bool, secondSession: Bool, longOlderReply: Bool = false) -> AppState {
@@ -119,27 +136,50 @@ final class CompletionCardLayoutTests: XCTestCase {
     /// Points of backdrop left under the panel's bottom edge, 0 when the
     /// panel runs into the window's last row.
     private func gapUnderPanel(_ state: AppState, notchHeight: CGFloat) throws -> CGFloat {
-        let maxVisible = UserDefaults.standard.object(forKey: SettingsKey.maxVisibleSessions) as? Int
-            ?? SettingsDefaults.maxVisibleSessions
-        let height = PanelHeightMetrics.desiredHeight(maxVisibleSessions: maxVisible)
-        let width: CGFloat = 620
-        let view = NotchPanelView(appState: state, hasNotch: true, notchHeight: notchHeight, notchW: 185, screenWidth: 1512)
-            .environment(\.mascotStaticTime, 5.2)
-            .background(Color(red: 1, green: 0, blue: 0))
-        let host = NSHostingView(rootView: view)
-        // As PanelWindowController hosts it: the window's size, not the content's.
-        host.sizingOptions = []
-        host.frame = NSRect(x: 0, y: 0, width: width, height: height)
-        let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.contentView = host
-        defer { window.contentView = nil }
+        let panel = try PanelHost(state, notchHeight: notchHeight)
+        defer { panel.close() }
         // The reply's area is sized from measurements of the laid-out panel,
         // which take a couple of update passes to settle.
         for _ in 0..<4 {
-            host.layoutSubtreeIfNeeded()
+            panel.host.layoutSubtreeIfNeeded()
             RunLoop.main.run(until: Date().addingTimeInterval(0.1))
         }
+        return try panel.gapUnderPanel()
+    }
+}
+
+/// The real panel hosted as PanelWindowController hosts it, on a red
+/// backdrop so the panel's black bottom edge can be read from the pixels.
+@MainActor
+private struct PanelHost {
+    let host: NSHostingView<AnyView>
+    let window: NSWindow
+    let height: CGFloat
+
+    init(_ state: AppState, notchHeight: CGFloat) throws {
+        let maxVisible = UserDefaults.standard.object(forKey: SettingsKey.maxVisibleSessions) as? Int
+            ?? SettingsDefaults.maxVisibleSessions
+        height = PanelHeightMetrics.desiredHeight(maxVisibleSessions: maxVisible)
+        let view = NotchPanelView(appState: state, hasNotch: true, notchHeight: notchHeight, notchW: 185, screenWidth: 1512)
+            .environment(\.mascotStaticTime, 5.2)
+            .background(Color(red: 1, green: 0, blue: 0))
+        host = NSHostingView(rootView: AnyView(view))
+        // As PanelWindowController hosts it: the window's size, not the content's.
+        host.sizingOptions = []
+        host.frame = NSRect(x: 0, y: 0, width: 620, height: height)
+        window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+    }
+
+    func close() {
+        window.orderOut(nil)
+        window.contentView = nil
+    }
+
+    /// Points of backdrop left under the panel's bottom edge, 0 when the
+    /// panel runs into the window's last row.
+    func gapUnderPanel() throws -> CGFloat {
         let rep = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
         host.cacheDisplay(in: host.bounds, to: rep)
         let image = try XCTUnwrap(rep.cgImage)
