@@ -83,8 +83,8 @@ private struct CompletionReplyView: View {
             // panel can chase each other without settling, so past a few
             // re-fits a second the cap is pinned where it is (#357).
             // ponytail: a pinned cap ignores chrome changes until the reply's
-            // height next changes; measuring the chrome on its own would let
-            // maxHeight drop the feedback and this guard.
+            // height changes after the window has passed; measuring the chrome
+            // on its own would let maxHeight drop the feedback and this guard.
             if refits.allows(at: ProcessInfo.processInfo.systemUptime, cap: maxHeight) {
                 replyHeight = height
             } else if refits.justTripped {

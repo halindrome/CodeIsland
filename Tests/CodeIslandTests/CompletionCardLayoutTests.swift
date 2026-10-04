@@ -18,6 +18,7 @@ final class CompletionCardLayoutTests: XCTestCase {
         SettingsKey.contentFontSize, SettingsKey.aiMessageLines, SettingsKey.maxVisibleSessions,
         SettingsKey.maxPanelHeight, SettingsKey.showTaskProgress, SettingsKey.showSessionRecap,
         SettingsKey.showUsageStats, SettingsKey.showClaudeQuota, SettingsKey.showProjectName,
+        SettingsKey.hideWhenNoSession,
     ]
     private var saved: [String: Any] = [:]
 
@@ -72,13 +73,14 @@ final class CompletionCardLayoutTests: XCTestCase {
         // other without settling (#357).
         let state = state(tasks: false, recap: false, secondSession: true)
         state.surface = .completionCard(sessionId: "gone")
-        let empty = AppState()
-        empty.surface = .completionCard(sessionId: "gone")
+        let noSessions = AppState()
+        noSessions.surface = .completionCard(sessionId: "gone")
 
-        // Only the "N sessions" link may separate it from an empty panel;
-        // any session card is taller than that.
+        // With no sessions the panel shows only the idle bar. The card may
+        // add its header and the "N sessions" link (38.5pt measured); any
+        // session card is taller than the 50pt allowed.
         let gap = try gapUnderPanel(state, notchHeight: 32)
-        XCTAssertGreaterThan(gap, try gapUnderPanel(empty, notchHeight: 32) - 50,
+        XCTAssertGreaterThan(gap, try gapUnderPanel(noSessions, notchHeight: 32) - 50,
                              "a card whose session is gone still renders other sessions")
     }
 
