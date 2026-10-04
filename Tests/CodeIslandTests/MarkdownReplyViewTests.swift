@@ -123,15 +123,34 @@ final class MarkdownReplyViewTests: XCTestCase {
 
     func testReplyStopsRefittingWhenItRefitsTooOftenAndRecoversLater() {
         let limiter = CompletionReplyRefitLimiter()
-        let start = Date()
+        let start: TimeInterval = 100
         for i in 0..<CompletionReplyRefitLimiter.maxRefits {
-            XCTAssertTrue(limiter.allows(at: start.addingTimeInterval(Double(i) * 0.01)))
+            XCTAssertTrue(limiter.allows(at: start + Double(i) * 0.01, cap: 300))
         }
-        XCTAssertFalse(limiter.allows(at: start.addingTimeInterval(0.5)), "a loop's next re-fit is refused")
+        XCTAssertFalse(limiter.allows(at: start + 0.5, cap: 300), "a loop's next re-fit is refused")
         XCTAssertTrue(limiter.justTripped, "the first refusal is the one that gets logged")
-        XCTAssertFalse(limiter.allows(at: start.addingTimeInterval(0.6)))
+        XCTAssertFalse(limiter.allows(at: start + 0.6, cap: 320))
         XCTAssertFalse(limiter.justTripped)
-        XCTAssertTrue(limiter.allows(at: start.addingTimeInterval(1.5)), "a later change re-fits again")
+        XCTAssertTrue(limiter.allows(at: start + 1.5, cap: 320), "a later change re-fits again")
+    }
+
+    func testATrippedReplyKeepsItsCapWhateverThePanelMeasures() {
+        // The panel's measured height also carries the reply's own height,
+        // so refusing replyHeight alone would leave the loop running through
+        // it (#357). A trip pins the cap the reply was laid out with.
+        let limiter = CompletionReplyRefitLimiter()
+        XCTAssertEqual(limiter.cap(500), 500, "no guard until it trips")
+        for i in 0..<CompletionReplyRefitLimiter.maxRefits {
+            _ = limiter.allows(at: Double(i) * 0.01, cap: 300)
+        }
+        XCTAssertFalse(limiter.allows(at: 0.5, cap: 300))
+        XCTAssertEqual(limiter.cap(239), 300, "a new panel measurement must not move a pinned cap")
+        XCTAssertEqual(limiter.cap(48), 300)
+        XCTAssertFalse(limiter.allows(at: 0.6, cap: 48))
+        XCTAssertEqual(limiter.cap(48), 300, "a later refusal keeps the cap pinned at the trip")
+
+        XCTAssertTrue(limiter.allows(at: 1.5, cap: 300))
+        XCTAssertEqual(limiter.cap(420), 420, "an allowed re-fit releases the pin")
     }
 
     func testOlderRepliesOnTheCompletionCardTakeOneOrTwoLines() {

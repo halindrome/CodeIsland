@@ -56,14 +56,14 @@ private struct CompletionReplyView: View {
     @State private var refits = CompletionReplyRefitLimiter()
 
     var body: some View {
-        let maxHeight = CompletionReplyMetrics.maxHeight(
+        let maxHeight = refits.cap(CompletionReplyMetrics.maxHeight(
             windowHeight: space?.windowHeight ?? 0,
             panelHeight: space?.panelHeight ?? 0,
             replyHeight: replyHeight,
             maxVisibleSessions: maxVisibleSessions,
             maxPanelHeight: maxPanelHeight,
             minimumHeight: CompletionReplyMetrics.minimumHeight(lineHeight: IslandMarkdownStyle.lineHeight(fontSize))
-        )
+        ))
         ScrollView(.vertical) {
             MarkdownBlocksView(blocks: ChatMessageTextFormatter.markdownBlocks(text), fontSize: fontSize)
                 // One scroll area for the whole reply: code and tables inside
@@ -78,13 +78,14 @@ private struct CompletionReplyView: View {
         .frame(maxHeight: maxHeight)
         .fixedSize(horizontal: false, vertical: true)
         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-            // replyHeight feeds back into maxHeight. Two replies sharing the
-            // panel's measurement can chase each other without settling, so
-            // past a few re-fits a second the height stops feeding back (#357).
-            // ponytail: after a trip the cap stays as it was until the next
-            // geometry change; make maxHeight independent of replyHeight if
-            // that ever shows (it needs the chrome measured on its own).
-            if refits.allows(at: Date()) {
+            // The reply's height feeds back into maxHeight, through replyHeight
+            // and through the panel's measured height. Two replies sharing the
+            // panel can chase each other without settling, so past a few
+            // re-fits a second the cap is pinned where it is (#357).
+            // ponytail: a pinned cap ignores chrome changes until the reply's
+            // height next changes; measuring the chrome on its own would let
+            // maxHeight drop the feedback and this guard.
+            if refits.allows(at: ProcessInfo.processInfo.systemUptime, cap: maxHeight) {
                 replyHeight = height
             } else if refits.justTripped {
                 log.error("completion reply re-fit loop stopped at \(height, privacy: .public)pt (panel \(space?.panelHeight ?? 0, privacy: .public)pt)")
@@ -116,24 +117,41 @@ final class CompletionCardSpace {
 
 /// Caps how often a completion reply re-fits itself to its measured
 /// height. Settling takes two or three re-fits; a feedback loop takes
-/// thousands a second. A class, so counting doesn't invalidate the view.
+/// thousands a second. Past the limit the reply keeps the cap it has, so
+/// nothing it reports can move its cap until a later window. A class, so
+/// counting doesn't invalidate the view.
 final class CompletionReplyRefitLimiter {
     static let maxRefits = 8
     static let window: TimeInterval = 1
 
-    private var windowStart = Date.distantPast
+    private var windowStart = -TimeInterval.infinity
     private var count = 0
-    /// True on the first refused re-fit of a window, for logging once.
+    private(set) var pinnedCap: CGFloat?
+    /// True on the refusal that pinned the cap, for logging once.
     private(set) var justTripped = false
 
-    func allows(at now: Date) -> Bool {
-        if now.timeIntervalSince(windowStart) >= Self.window {
+    /// The cap to lay out with: the pinned one while the guard holds.
+    func cap(_ computed: CGFloat) -> CGFloat {
+        pinnedCap ?? computed
+    }
+
+    /// Whether the reply may re-fit to a new height. `cap` is the cap that
+    /// height was laid out with; it is the one pinned on a trip. `now` is a
+    /// monotonic time, so a clock change can't hold the window open.
+    func allows(at now: TimeInterval, cap: CGFloat) -> Bool {
+        if now - windowStart >= Self.window {
             windowStart = now
             count = 0
         }
         count += 1
-        justTripped = count == Self.maxRefits + 1
-        return count <= Self.maxRefits
+        if count <= Self.maxRefits {
+            pinnedCap = nil
+            justTripped = false
+            return true
+        }
+        justTripped = pinnedCap == nil
+        if justTripped { pinnedCap = cap }
+        return false
     }
 }
 
