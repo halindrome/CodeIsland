@@ -50,20 +50,15 @@ private struct CompletionReplyView: View {
     @AppStorage(SettingsKey.maxVisibleSessions) private var maxVisibleSessions = SettingsDefaults.maxVisibleSessions
     @AppStorage(SettingsKey.maxPanelHeight) private var maxPanelHeight = SettingsDefaults.maxPanelHeight
     @Environment(CompletionCardSpace.self) private var space: CompletionCardSpace?
-    /// This view's own laid-out height, so the rest of the card can be told
-    /// apart from it in the panel's measured height.
-    @State private var replyHeight: CGFloat = 0
-    @State private var refits = CompletionReplyRefitLimiter()
 
     var body: some View {
-        let maxHeight = refits.cap(CompletionReplyMetrics.maxHeight(
+        let maxHeight = CompletionReplyMetrics.maxHeight(
             windowHeight: space?.windowHeight ?? 0,
-            panelHeight: space?.panelHeight ?? 0,
-            replyHeight: replyHeight,
+            chrome: space?.chrome,
             maxVisibleSessions: maxVisibleSessions,
             maxPanelHeight: maxPanelHeight,
             minimumHeight: CompletionReplyMetrics.minimumHeight(lineHeight: IslandMarkdownStyle.lineHeight(fontSize))
-        ))
+        )
         ScrollView(.vertical) {
             MarkdownBlocksView(blocks: ChatMessageTextFormatter.markdownBlocks(text), fontSize: fontSize)
                 // One scroll area for the whole reply: code and tables inside
@@ -77,81 +72,102 @@ private struct CompletionReplyView: View {
         // hugs a short reply and stops growing at maxHeight.
         .frame(maxHeight: maxHeight)
         .fixedSize(horizontal: false, vertical: true)
-        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { height in
-            // The reply's height feeds back into maxHeight, through replyHeight
-            // and through the panel's measured height. Two replies sharing the
-            // panel can chase each other without settling, so past a few
-            // re-fits a second the cap is pinned where it is (#357).
-            // ponytail: a pinned cap ignores chrome changes until the reply's
-            // height changes after the window has passed; measuring the chrome
-            // on its own would let maxHeight drop the feedback and this guard.
-            if refits.allows(at: ProcessInfo.processInfo.systemUptime, cap: maxHeight) {
-                replyHeight = height
-            } else if refits.justTripped {
-                log.error("completion reply re-fit loop stopped at \(height, privacy: .public)pt (panel \(space?.panelHeight ?? 0, privacy: .public)pt)")
-            }
-        }
+        // Found in the panel by NotchPanelView, which measures the rest of
+        // the card around it (recordsCompletionCardChrome).
+        .anchorPreference(key: CompletionReplyBounds.self, value: .bounds) { [$0] }
         .scrollIndicatorsFlash(onAppear: true)
         .tint(IslandMarkdownStyle.link)
     }
 }
 
 /// How much room the completion card has, measured by NotchPanelView: the
-/// panel window's height (already clamped to the screen) and the expanded
-/// panel's laid-out height. Observable rather than view state so a change
-/// only re-renders the reply that reads it, not the whole panel.
+/// panel window's height (already clamped to the screen) and the rest of the
+/// card around the reply. Observable rather than view state so a change only
+/// re-renders the reply that reads it, not the whole panel.
 @MainActor
 @Observable
 final class CompletionCardSpace {
     private(set) var windowHeight: CGFloat = 0
-    private(set) var panelHeight: CGFloat = 0
+    /// nil until a panel showing a reply has been measured.
+    private(set) var chrome: CompletionCardChrome?
+    @ObservationIgnored private var refits = CompletionCardRefitLimiter()
 
     func recordWindowHeight(_ height: CGFloat) {
         if windowHeight != height { windowHeight = height }
     }
 
-    func recordPanelHeight(_ height: CGFloat) {
-        if panelHeight != height { panelHeight = height }
+    func recordChrome(_ measured: CompletionCardChrome, at now: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        // A panel without a reply says nothing about a reply's room.
+        guard measured.replies > 0, measured != chrome else { return }
+        guard refits.allows(at: now) else {
+            if refits.justTripped {
+                log.error("completion card re-fit loop stopped at \(measured.height, privacy: .public)pt chrome, \(measured.replies, privacy: .public) replies")
+            }
+            return
+        }
+        chrome = measured
     }
 }
 
-/// Caps how often a completion reply re-fits itself to its measured
-/// height. Settling takes two or three re-fits; a feedback loop takes
-/// thousands a second. Past the limit the reply keeps the cap it has, so
-/// nothing it reports can move its cap until a later window. A class, so
-/// counting doesn't invalidate the view.
-final class CompletionReplyRefitLimiter {
+/// Everything in the expanded panel except its completion replies, and how
+/// many replies share the room that leaves. Measured in one layout pass from
+/// the panel and the replies in it, so a reply growing or shrinking leaves it
+/// unchanged: no reply's cap depends on its own height (#357).
+struct CompletionCardChrome: Equatable {
+    var height: CGFloat
+    var replies: Int
+}
+
+/// The bounds of every completion reply in the panel. Normally one.
+struct CompletionReplyBounds: PreferenceKey {
+    static let defaultValue: [Anchor<CGRect>] = []
+
+    static func reduce(value: inout [Anchor<CGRect>], nextValue: () -> [Anchor<CGRect>]) {
+        value += nextValue()
+    }
+}
+
+extension View {
+    /// Records this view's height minus the completion replies inside it, both
+    /// read from the same layout pass, as the card's chrome in `space`. Put on
+    /// the expanded panel, whose replies size themselves from it.
+    func recordsCompletionCardChrome(in space: CompletionCardSpace) -> some View {
+        backgroundPreferenceValue(CompletionReplyBounds.self) { replies in
+            GeometryReader { panel in
+                let chrome = CompletionCardChrome(
+                    height: replies.reduce(panel.size.height) { $0 - panel[$1].height },
+                    replies: replies.count
+                )
+                Color.clear.onChange(of: chrome, initial: true) { space.recordChrome(chrome) }
+            }
+        }
+    }
+}
+
+/// A safety net under the completion card's sizing: caps how often its chrome
+/// may change. Settling takes one or two measurements; a layout loop would take
+/// thousands a second and hang the main thread, and every hook bridge waiting
+/// on it. Past the limit new measurements are dropped until the window has
+/// passed, which holds every reply's cap where it is.
+struct CompletionCardRefitLimiter {
     static let maxRefits = 8
     static let window: TimeInterval = 1
 
     private var windowStart = -TimeInterval.infinity
     private var count = 0
-    private(set) var pinnedCap: CGFloat?
-    /// True on the refusal that pinned the cap, for logging once.
-    private(set) var justTripped = false
 
-    /// The cap to lay out with: the pinned one while the guard holds.
-    func cap(_ computed: CGFloat) -> CGFloat {
-        pinnedCap ?? computed
-    }
+    /// True on the first refusal in a window, for logging once.
+    var justTripped: Bool { count == Self.maxRefits + 1 }
 
-    /// Whether the reply may re-fit to a new height. `cap` is the cap that
-    /// height was laid out with; it is the one pinned on a trip. `now` is a
-    /// monotonic time, so a clock change can't hold the window open.
-    func allows(at now: TimeInterval, cap: CGFloat) -> Bool {
+    /// Whether a new measurement may be taken. `now` is a monotonic time, so
+    /// a clock change can't hold the window open.
+    mutating func allows(at now: TimeInterval) -> Bool {
         if now - windowStart >= Self.window {
             windowStart = now
             count = 0
         }
         count += 1
-        if count <= Self.maxRefits {
-            pinnedCap = nil
-            justTripped = false
-            return true
-        }
-        justTripped = pinnedCap == nil
-        if justTripped { pinnedCap = cap }
-        return false
+        return count <= Self.maxRefits
     }
 }
 
@@ -172,17 +188,16 @@ enum CompletionReplyMetrics {
     /// card is laid out. That rest — notch bar, card header, task progress
     /// (expanded or not), older messages, the recap, the "N sessions" link,
     /// paddings — changes with the notch height, the font size and the
-    /// settings, so it is measured, not estimated: the panel's height minus
-    /// the reply's own. The window is further capped by the maxPanelHeight
-    /// setting, which keeps an auto-opening card from covering half the
-    /// screen when the session list is set to "unlimited".
+    /// settings, so it is measured, not estimated (CompletionCardChrome). The
+    /// window is further capped by the maxPanelHeight setting, which keeps an
+    /// auto-opening card from covering half the screen when the session list
+    /// is set to "unlimited".
     ///
     /// Content past the window's bottom edge is simply cut, so this is what
     /// keeps the card whole.
     static func maxHeight(
         windowHeight: CGFloat,
-        panelHeight: CGFloat,
-        replyHeight: CGFloat,
+        chrome: CompletionCardChrome?,
         maxVisibleSessions: Int,
         maxPanelHeight: Int,
         minimumHeight: CGFloat
@@ -193,11 +208,12 @@ enum CompletionReplyMetrics {
         if maxPanelHeight > 0 {
             limit = min(limit, CGFloat(maxPanelHeight))
         }
-        // The panel contains the reply, so a panel no taller than the reply
-        // is a stale measurement from before the card opened.
-        let measured = replyHeight > 0 && panelHeight > replyHeight
-        let chrome = measured ? panelHeight - replyHeight : estimatedChromeHeight
-        return max(minimumHeight, (limit - chrome - bottomMargin).rounded(.down))
+        let room = limit - (chrome?.height ?? estimatedChromeHeight) - bottomMargin
+        // Replies on screen together share the room. Each taking all of it
+        // would count the others as chrome, and they'd chase each other's
+        // height without settling (#357).
+        let share = room / CGFloat(max(1, chrome?.replies ?? 1))
+        return max(minimumHeight, share.rounded(.down))
     }
 
     /// The message the completion card renders in full: the newest one, when

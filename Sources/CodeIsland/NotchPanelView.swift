@@ -139,7 +139,7 @@ struct NotchPanelView: View {
     @State private var curtainOffset: CGFloat = 0
     @State private var curtainOpacity: Double = 1
     @State private var displayedToolStatus: Bool = SettingsDefaults.showToolStatus
-    /// Window and panel heights for the completion card's reply area.
+    /// Window height and card chrome for the completion card's reply area.
     @State private var cardSpace = CompletionCardSpace()
 
     private var isActive: Bool { !appState.sessions.isEmpty }
@@ -339,7 +339,7 @@ struct NotchPanelView: View {
                     }
                 }
             }
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { cardSpace.recordPanelHeight($0) }
+            .recordsCompletionCardChrome(in: cardSpace)
             .frame(width: panelWidth)
             .clipped()
             .background(
