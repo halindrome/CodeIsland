@@ -1146,13 +1146,18 @@ def install_codex():
     # other entries mirror Codex's complete public lifecycle surface, keeping
     # remote status fidelity identical to local sessions.
     blocking_entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 86400}]}]
+    # Codex caps SessionEnd / Interrupt hooks at 3 s and warns about any
+    # longer configured timeout, so match the local installer's 3 s there.
+    teardown_entry = [{"hooks": [{"type": "command", "command": cmd, "timeout": 3}]}]
     for event in [
         "PreToolUse", "PostToolUse", "PreCompact", "PostCompact",
-        "SessionStart", "SessionEnd", "SubagentStart", "SubagentStop",
-        "UserPromptSubmit", "Stop", "Interrupt",
+        "SessionStart", "SubagentStart", "SubagentStop",
+        "UserPromptSubmit", "Stop",
     ]:
         append_our_hooks(hooks, event, entry)
     append_our_hooks(hooks, "PermissionRequest", blocking_entry)
+    append_our_hooks(hooks, "SessionEnd", teardown_entry)
+    append_our_hooks(hooks, "Interrupt", teardown_entry)
     data["hooks"] = hooks
     write_json(hooks_path, data)
     if not ensure_toml_codex_hooks(codex_root / "config.toml"):

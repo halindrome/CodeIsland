@@ -233,6 +233,28 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
         XCTAssertEqual(Set(hooks.keys), expectedEvents)
     }
 
+    /// Codex clamps SessionEnd / Interrupt hooks to 3 s and warns about any
+    /// longer timeout; a reconnect must also replace a stale 60 s entry.
+    func testCodexTeardownHooksStayWithinCodexTimeoutCap() throws {
+        let stale: [String: Any] = ["hooks": [[
+            "type": "command", "timeout": 60,
+            "command": "CODEISLAND_SOURCE=codex python3 ~/.codeisland/codeisland-remote-hook.py",
+        ]]]
+        try writeJSON(["hooks": ["Interrupt": [stale]]], to: ".codex/hooks.json")
+
+        try runConfigureScript()
+
+        let hooks = try XCTUnwrap(readJSON(".codex/hooks.json")["hooks"] as? [String: Any])
+        func timeouts(_ event: String) -> [Int] {
+            ((hooks[event] as? [[String: Any]]) ?? []).flatMap { entry in
+                ((entry["hooks"] as? [[String: Any]]) ?? []).compactMap { $0["timeout"] as? Int }
+            }
+        }
+        XCTAssertEqual(timeouts("SessionEnd"), [3])
+        XCTAssertEqual(timeouts("Interrupt"), [3])
+        XCTAssertEqual(timeouts("Stop"), [60])
+    }
+
     func testQoderInstallIsIdempotentAcrossReconnects() throws {
         let userEntry: [String: Any] = [
             "hooks": [["type": "command", "command": "echo keep-qoder", "timeout": 5]],

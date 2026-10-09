@@ -320,7 +320,7 @@ struct ConfigInstaller {
                 ("SubagentStart", 5, false),
                 ("SubagentStop", 5, false),
                 ("Stop", 5, false),
-                ("Interrupt", 5, false),
+                ("Interrupt", 3, false),
             ],
             rootOverride: { ConfigInstaller.codexHome() },
             displayPathOverride: { ConfigInstaller.displayCodexPath(filename: "hooks.json") }
