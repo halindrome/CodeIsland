@@ -67,6 +67,17 @@ enum HookFormat {
     /// is a blocking approval hook: its stdout decision resolves ZCode's
     /// permission dialog (#258).
     case zcode
+    /// MiniMax Code CLI (`mcode`, npm @minimax-ai/code). The hook contract is
+    /// Claude-compatible (same PascalCase events, same stdin/stdout JSON), but
+    /// mcode has NO settings.json hooks key — shell hooks are only loadable
+    /// through a Plugin. The installer writes a local plugin pack
+    /// (~/.minimax/plugins/codeisland/ with .claude-plugin/plugin.json +
+    /// hooks/hooks.json), which `mcode` auto-discovers by scanning the plugins
+    /// directory. Verified against mcode 0.6.x: hook stdin carries
+    /// hook_event_name/session_id/transcript_path/cwd like Claude, and the
+    /// PermissionRequest stdout decision resolves mcode's approval prompt —
+    /// but hook timeouts are capped at 10 s (see `defaultEvents`).
+    case minimaxPlugin
 
     var storageValue: String {
         switch self {
@@ -83,6 +94,7 @@ enum HookFormat {
         case .hermes: return "hermes"
         case .antigravityNamed: return "antigravityNamed"
         case .zcode: return "zcode"
+        case .minimaxPlugin: return "minimaxPlugin"
         }
     }
 
@@ -101,6 +113,7 @@ enum HookFormat {
         case "hermes": self = .hermes
         case "antigravitynamed": self = .antigravityNamed
         case "zcode": self = .zcode
+        case "minimaxplugin": self = .minimaxPlugin
         default: return nil
         }
     }
@@ -263,6 +276,43 @@ struct ConfigInstaller {
         return raw.isEmpty ? "~/.grok/\(filename)" : "$GROK_HOME/\(filename)"
     }
 
+    // MARK: - MiniMax Code home resolution
+
+    /// Resolve MiniMax Code CLI's data root. `MINIMAX_DATA_DIR` overrides the
+    /// default `~/.minimax` (the docs list `MAVIS_DATA_DIR` as a compatibility
+    /// fallback with lower priority). Whitespace-only values are treated as unset.
+    static func minimaxHome() -> String {
+        for key in ["MINIMAX_DATA_DIR", "MAVIS_DATA_DIR"] {
+            let raw = (ProcessInfo.processInfo.environment[key] ?? "")
+                .trimmingCharacters(in: .whitespaces)
+            guard !raw.isEmpty else { continue }
+            if raw == "~" { return NSHomeDirectory() }
+            if raw.hasPrefix("~/") { return NSHomeDirectory() + "/" + raw.dropFirst(2) }
+            return raw
+        }
+        return NSHomeDirectory() + "/.minimax"
+    }
+
+    /// Local plugin pack the installer writes (hooks can only be declared
+    /// through a plugin — mcode has no settings.json hooks key).
+    static func minimaxPluginDir() -> String { minimaxHome() + "/plugins/codeisland" }
+
+    /// User-visible form of a MiniMax config path (uses `$MINIMAX_DATA_DIR/…`
+    /// when the env var is set, otherwise `~/.minimax/…`).
+    static func displayMinimaxPath(filename: String) -> String {
+        let raw = (ProcessInfo.processInfo.environment["MINIMAX_DATA_DIR"] ?? "")
+            .trimmingCharacters(in: .whitespaces)
+        return raw.isEmpty ? "~/.minimax/\(filename)" : "$MINIMAX_DATA_DIR/\(filename)"
+    }
+
+    /// Whether any MiniMax Code install footprint is on this machine. The
+    /// installer must not create `~/.minimax` out of nowhere — a bare home
+    /// directory would make `cliExists` report a phantom install (same rule
+    /// as Kimi's presence gate).
+    static func minimaxPresenceDetected(fm: FileManager = .default) -> Bool {
+        fm.fileExists(atPath: minimaxHome())
+    }
+
     // MARK: - All supported CLIs
 
     private static let builtInCLIs: [CLIConfig] = [
@@ -320,7 +370,7 @@ struct ConfigInstaller {
                 ("SubagentStart", 5, false),
                 ("SubagentStop", 5, false),
                 ("Stop", 5, false),
-                ("Interrupt", 5, false),
+                ("Interrupt", 3, false),
             ],
             rootOverride: { ConfigInstaller.codexHome() },
             displayPathOverride: { ConfigInstaller.displayCodexPath(filename: "hooks.json") }
@@ -647,6 +697,21 @@ struct ConfigInstaller {
             configPath: ".zcode/cli/config.json", configKey: "hooks",
             format: .zcode,
             events: defaultEvents(for: .zcode)
+        ),
+        // MiniMax Code CLI (`mcode`) — hook contract is Claude-compatible, but
+        // hooks are only loadable through a local Plugin. The dedicated
+        // installer (see `.minimaxPlugin`) writes the whole plugin pack;
+        // configPath below is the hooks file inside it, for display/repair.
+        // mcode auto-discovers the plugin on the next session start.
+        CLIConfig(
+            name: "MiniMax Code CLI", source: "minimax",
+            configPath: "plugins/codeisland/hooks/hooks.json", configKey: "hooks",
+            format: .minimaxPlugin,
+            events: defaultEvents(for: .minimaxPlugin),
+            rootOverride: { ConfigInstaller.minimaxHome() },
+            displayPathOverride: {
+                ConfigInstaller.displayMinimaxPath(filename: "plugins/codeisland/hooks/hooks.json")
+            }
         )
     ]
 
@@ -818,6 +883,32 @@ struct ConfigInstaller {
                 ("PostToolUse", 5, true),
                 ("PostToolUseFailure", 5, true),
                 ("Stop", 5, true),
+            ]
+        case .minimaxPlugin:
+            // The full event registry compiled into mcode: SessionStart,
+            // SessionEnd, UserPromptSubmit, PreToolUse, PermissionRequest,
+            // PostToolUse, SubagentStart, SubagentStop, Stop, PreCompact,
+            // PostCompact (no Notification). Timeouts are in SECONDS and mcode
+            // only accepts an integer from 1 to 10: anything else voids that
+            // handler (HOOK_SCHEMA_INVALID), so Claude's day-long
+            // PermissionRequest ceiling would silently drop approvals. A hook
+            // that runs out fails open, so PermissionRequest takes the 10 s
+            // maximum: the island can answer within that window, then mcode's
+            // own prompt takes over (the bridge is killed and the card goes
+            // with it). There is no PostToolUseFailure event to own the error
+            // sound.
+            return [
+                ("SessionStart", 5, false),
+                ("UserPromptSubmit", 5, true),
+                ("PreToolUse", 5, false),
+                ("PermissionRequest", 10, false),
+                ("PostToolUse", 5, true),
+                ("SubagentStart", 5, true),
+                ("SubagentStop", 5, true),
+                ("Stop", 5, true),
+                ("PreCompact", 5, true),
+                ("PostCompact", 5, true),
+                ("SessionEnd", 5, true),
             ]
         }
     }
@@ -1002,10 +1093,10 @@ struct ConfigInstaller {
             if installHooks(inExtraDir: cli, fm: fm) == .failed { ok = false }
         }
 
-        // Codex requires hooks = true in config.toml
+        // Codex's required feature flag is installed by installExternalHooks;
+        // its failure contributes to `ok` above, rather than reporting success.
         if isEnabled(source: "codex"),
            fm.fileExists(atPath: codexHome()) {
-            enableCodexHooksConfig(fm: fm)
             repairCodexMCPApprovalTables(fm: fm)
         }
 
@@ -1131,6 +1222,9 @@ struct ConfigInstaller {
         if source == "zcode" { return FileManager.default.fileExists(atPath: NSHomeDirectory() + "/.zcode") }
         // Kimi Code CLI moved from ~/.kimi (kimi-cli) to ~/.kimi-code.
         if source == "kimi" { return kimiPresenceDetected() }
+        // MiniMax Code CLI: detect the data root (honors $MINIMAX_DATA_DIR) —
+        // the plugin dir only exists AFTER we install hooks.
+        if source == "minimax" { return minimaxPresenceDetected() }
         guard let cli = allCLIs.first(where: { $0.source == source }) else { return false }
         return FileManager.default.fileExists(atPath: cli.dirPath)
     }
@@ -1237,8 +1331,7 @@ struct ConfigInstaller {
             } else if cli.format == .zcode {
                 return installZcodeHooks(fm: fm)
             } else {
-                installExternalHooks(cli: cli, fm: fm)
-                if cli.source == "codex" { enableCodexHooksConfig(fm: fm) }
+                guard installExternalHooks(cli: cli, fm: fm) else { return false }
                 return isHooksInstalled(for: cli, fm: fm)
             }
         } else {
@@ -1289,6 +1382,11 @@ struct ConfigInstaller {
             } else if cli.format == .zcode {
                 // Config lives one level below the app's real root (#245).
                 dirExists = fm.fileExists(atPath: NSHomeDirectory() + "/.zcode")
+            } else if cli.source == "minimax" {
+                // The plugin pack lives two levels under the data root, so the
+                // generic dirPath check would never exist pre-install; the
+                // data root itself is the installation marker.
+                dirExists = fm.fileExists(atPath: minimaxHome())
             } else {
                 dirExists = fm.fileExists(atPath: cli.dirPath)
             }
@@ -1338,8 +1436,7 @@ struct ConfigInstaller {
                     repaired.append(cli.name)
                 }
             } else {
-                installExternalHooks(cli: cli, fm: fm)
-                if cli.source == "codex" { enableCodexHooksConfig(fm: fm) }
+                guard installExternalHooks(cli: cli, fm: fm) else { continue }
                 if isHooksInstalled(for: cli, fm: fm) {
                     repaired.append(cli.name)
                 }
@@ -1348,7 +1445,9 @@ struct ConfigInstaller {
         // Codex config.toml: ensure hooks = true
         if isEnabled(source: "codex"),
            fm.fileExists(atPath: codexHome()) {
-            enableCodexHooksConfig(fm: fm)
+            if !enableCodexHooksConfig(fm: fm) {
+                repaired.removeAll { $0 == "Codex" }
+            }
         }
         repaired.append(contentsOf: repairExtraConfigDirs(fm: fm))
         // OpenCode plugin
@@ -1597,6 +1696,11 @@ struct ConfigInstaller {
             }
             return installKimiHooks(cli: cli, fm: fm)
         }
+        if cli.format == .minimaxPlugin {
+            // MiniMax: dedicated installer — hooks live in a local plugin pack,
+            // not a settings.json hooks key (see the MiniMax MARK section).
+            return installMinimaxHooks(cli: cli, fm: fm)
+        }
 
         if cli.format == .copilot {
             // Copilot: check root ~/.copilot exists, create hooks subdir if needed
@@ -1698,6 +1802,10 @@ struct ConfigInstaller {
             case .kimi:
                 // Handled earlier in the function; should never reach here
                 return false
+            case .minimaxPlugin:
+                // MiniMax uses a dedicated installer (installMinimaxHooks) that
+                // writes a whole plugin pack; never reaches this generic path.
+                return false
             case .hermes:
                 // Hermes uses a dedicated YAML installer (installHermesHooks);
                 // never reaches the JSON external-hook path.
@@ -1760,13 +1868,18 @@ struct ConfigInstaller {
             """
         }
 
-        return writeJSONWithKey(
+        guard writeJSONWithKey(
             cli: cli,
             originalText: seeded,
             key: cli.configKey,
             value: hooks,
             fm: fm
-        )
+        ) else { return false }
+        // A hooks.json without the activation flag is not an installed Codex
+        // integration. Extra roots perform their own shared-file ownership check
+        // before activating; primary install/toggle/repair must propagate failure.
+        return cli.source != "codex" || cli.extraConfigDir != nil
+            || enableCodexHooksConfig(fm: fm, codexHome: cli.dirPath)
     }
 
     private static func managedTraecliHookObject(source: String = "traecli") -> [String: Any] {
@@ -2595,6 +2708,154 @@ struct ConfigInstaller {
         return removeManagedZcodeHooks(from: contents) != contents
     }
 
+    // MARK: - MiniMax Code plugin pack
+    //
+    // mcode (npm @minimax-ai/code) has no settings.json "hooks" key — shell
+    // hooks are only loadable through a Plugin. A local plugin is just a
+    // directory under `~/.minimax/plugins/<name>/` that mcode discovers by
+    // scanning (verified with `mcode plugin list`: a bare directory with a
+    // manifest shows up as `<name>@local`). We write the Claude-compatible
+    // layout, which mcode parses with sourceFormat CLAUDE:
+    //
+    //   <root>/plugins/codeisland/
+    //   ├── .claude-plugin/plugin.json   {name, hooks: ["hooks/hooks.json"]}
+    //   └── hooks/hooks.json             {hooks: {Event: [{hooks: [{…}]}]}}
+    //
+    // The hook contract itself is Claude-compatible: stdin carries
+    // hook_event_name/session_id/transcript_path/cwd, and a PermissionRequest
+    // stdout decision resolves mcode's approval prompt. No registration file,
+    // no restart of any daemon — the plugin is picked up by the next mcode
+    // session start.
+
+    /// Marker written into the manifest so uninstall only ever removes OUR pack.
+    private static let minimaxManifestMarker = "CodeIsland MiniMax Code plugin"
+
+    /// The bridge command we inject for MiniMax hooks (path quoted if it has spaces).
+    private static func minimaxInjectedCommand() -> String {
+        let quotedBridge = bridgeCommand.contains(" ") ? "\"\(bridgeCommand)\"" : bridgeCommand
+        return "\(quotedBridge) --source minimax"
+    }
+
+    /// Build the plugin manifest document — pure so tests can exercise it.
+    static func minimaxManifestDocument() -> [String: Any] {
+        [
+            "name": "codeisland",
+            "displayName": "CodeIsland",
+            "version": "1.0.0",
+            "description": minimaxManifestMarker,
+            "hooks": ["hooks/hooks.json"],
+        ]
+    }
+
+    /// Build the full hooks.json document for the plugin pack — pure so tests
+    /// can exercise it. Claude-compatible entry shape, no `matcher`: mcode
+    /// accepts an omitted matcher on every event (the parsing code only
+    /// validates matcher when present), and both the shipped clawd-state
+    /// plugin and our own probe fired with this shape.
+    static func minimaxHooksDocument() -> [String: Any] {
+        let command = minimaxInjectedCommand()
+        var hooks: [String: Any] = [:]
+        for (event, timeout, _) in defaultEvents(for: .minimaxPlugin) {
+            hooks[event] = [["hooks": [["type": "command", "command": command, "timeout": timeout]]]]
+        }
+        return ["hooks": hooks]
+    }
+
+    @discardableResult
+    private static func installMinimaxHooks(cli: CLIConfig, fm: FileManager) -> Bool {
+        // Only engage machines that actually have MiniMax Code — creating
+        // ~/.minimax out of nowhere would turn cliExists into a phantom yes
+        // (same rule as Kimi's presence gate).
+        guard minimaxPresenceDetected(fm: fm) else { return true }
+
+        let hooksDir = (cli.fullPath as NSString).deletingLastPathComponent
+        let manifestPath = minimaxManifestPath(cli: cli)
+        // A plugin someone else put at plugins/codeisland is not ours to
+        // overwrite (uninstall refuses to delete it for the same reason).
+        if let existing = fm.contents(atPath: manifestPath), !minimaxManifestIsOurs(existing) {
+            return false
+        }
+        let manifestDir = (manifestPath as NSString).deletingLastPathComponent
+        for dir in [manifestDir, hooksDir] where !fm.fileExists(atPath: dir) {
+            do {
+                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            } catch {
+                return false
+            }
+        }
+
+        guard let manifest = try? JSONSerialization.data(
+                  withJSONObject: minimaxManifestDocument(),
+                  options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+              ),
+              let hooksDoc = try? JSONSerialization.data(
+                  withJSONObject: minimaxHooksDocument(),
+                  options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+              )
+        else { return false }
+
+        // Runs on every launch: leave files that are already current alone.
+        func writeIfChanged(_ data: Data, to path: String) -> Bool {
+            fm.contents(atPath: path) == data || fm.createFile(atPath: path, contents: data)
+        }
+        return writeIfChanged(manifest, to: manifestPath)
+            && writeIfChanged(hooksDoc, to: cli.fullPath)
+    }
+
+    private static func minimaxManifestPath(cli: CLIConfig) -> String {
+        let hooksDir = (cli.fullPath as NSString).deletingLastPathComponent
+        let pluginDir = (hooksDir as NSString).deletingLastPathComponent   // …/plugins/codeisland
+        return pluginDir + "/.claude-plugin/plugin.json"
+    }
+
+    private static func minimaxManifestIsOurs(_ data: Data) -> Bool {
+        String(data: data, encoding: .utf8)?.contains(minimaxManifestMarker) == true
+    }
+
+    /// The pack is installed when our manifest is in place and hooks.json is
+    /// exactly the document we generate — so a stale bridge path, timeout or
+    /// event list (or a deleted manifest) reads as drift and gets rewritten.
+    static func isMinimaxPluginInstalled(cli: CLIConfig, fm: FileManager) -> Bool {
+        guard let manifest = fm.contents(atPath: minimaxManifestPath(cli: cli)),
+              minimaxManifestIsOurs(manifest),
+              let hooks = parseJSONFile(at: cli.fullPath, fm: fm)
+        else { return false }
+        return NSDictionary(dictionary: hooks).isEqual(to: minimaxHooksDocument())
+    }
+
+    private static func uninstallMinimaxHooks(cli: CLIConfig, fm: FileManager) {
+        let hooksPath = cli.fullPath
+        let hooksDir = (hooksPath as NSString).deletingLastPathComponent
+        let pluginDir = (hooksDir as NSString).deletingLastPathComponent
+
+        // The pack directory is entirely ours — remove it wholesale when the
+        // manifest proves it (never delete a foreign plugin that happens to
+        // share the directory name).
+        if let data = fm.contents(atPath: minimaxManifestPath(cli: cli)), minimaxManifestIsOurs(data) {
+            try? fm.removeItem(atPath: pluginDir)
+            return
+        }
+
+        // Manifest missing or foreign: still scrub managed entries from any
+        // hooks.json we may have contributed to, leaving foreign content alone.
+        guard fm.fileExists(atPath: hooksPath),
+              let root = parseJSONFile(at: hooksPath, fm: fm),
+              var hooks = root[cli.configKey] as? [String: Any],
+              let originalText = fm.contents(atPath: hooksPath).flatMap({ String(data: $0, encoding: .utf8) })
+        else { return }
+
+        hooks = removeManagedHookEntries(from: hooks)
+        let merged: String?
+        if hooks.isEmpty {
+            merged = JSONMinimalEditor.deleteTopLevelKey(in: originalText, key: cli.configKey)
+        } else {
+            merged = JSONMinimalEditor.setTopLevelValue(in: originalText, key: cli.configKey, value: hooks)
+        }
+        if let merged, let data = merged.data(using: .utf8) {
+            ConfigPathIdentity.write(data, to: hooksPath, fileManager: fm)
+        }
+    }
+
     // MARK: - Codex config.toml
 
     /// Clears out the transport-less `[mcp_servers.*.tools.*]` tables an older
@@ -2613,8 +2874,11 @@ struct ConfigInstaller {
         return ConfigPathIdentity.write(Data(repaired.utf8), to: configPath, fileManager: fm)
     }
 
-    /// Ensure hooks = true under [features] in $CODEX_HOME/config.toml
+    /// Ensure the Codex hooks feature flag is true in $CODEX_HOME/config.toml
     /// (or ~/.codex/config.toml when unset) so Codex actually fires hook events.
+    /// The source editor recognizes quoted/bare keys and table scope without
+    /// touching comments, unrelated flags or strings containing TOML examples.
+    /// An unsupported/conflicting layout is left untouched and returns false.
     /// `codexHome` is overridden for extra Codex roots registered in Settings —
     /// each root has its own config.toml, and a hooks.json without the flag
     /// next to it is never read. A symlinked config.toml is edited at its
@@ -2626,58 +2890,15 @@ struct ConfigInstaller {
             atPath: (configPath as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true
         )
-        var contents = ""
+        let contents: String
         if fm.fileExists(atPath: configPath) {
-            contents = (try? String(contentsOfFile: configPath, encoding: .utf8)) ?? ""
-        }
-
-        let currentHooksPattern = #"(?m)^\s*hooks\s*=\s*(true|false)\s*(#.*)?$"#
-        let hooksTruePattern = #"(?m)^\s*hooks\s*=\s*true\s*(#.*)?$"#
-        let hooksFalsePattern = #"(?m)^\s*hooks\s*=\s*false\s*(#.*)?$"#
-        let legacyHooksPattern = #"(?m)^\s*codex_hooks\s*=\s*(true|false)\s*(#.*)?$"#
-        let hasCurrentHooks = contents.range(of: currentHooksPattern, options: .regularExpression) != nil
-        let hasLegacyHooks = contents.range(of: legacyHooksPattern, options: .regularExpression) != nil
-
-        // Remove the retired feature name used by older Codex releases. If the
-        // current flag is absent, turn the legacy flag into the current one.
-        if hasLegacyHooks {
-            contents = contents.replacingOccurrences(
-                of: legacyHooksPattern,
-                with: hasCurrentHooks ? "" : "hooks = true",
-                options: .regularExpression
-            )
-        }
-
-        // Already set to true (non-commented) — don't touch beyond legacy cleanup.
-        if contents.range(of: hooksTruePattern, options: .regularExpression) != nil {
-            if hasLegacyHooks {
-                return ConfigPathIdentity.write(Data(contents.utf8), to: configPath, fileManager: fm)
-            }
-            return true
-        }
-
-        // Set to false (non-commented) — flip it to true in place.
-        if contents.range(of: hooksFalsePattern, options: .regularExpression) != nil {
-            contents = contents.replacingOccurrences(
-                of: hooksFalsePattern,
-                with: "hooks = true",
-                options: .regularExpression
-            )
-            return ConfigPathIdentity.write(Data(contents.utf8), to: configPath, fileManager: fm)
-        }
-
-        // Not present — insert into [features] section or create it
-        var lines = contents.components(separatedBy: "\n")
-        if let featIdx = lines.firstIndex(where: { $0.trimmingCharacters(in: .whitespaces) == "[features]" }) {
-            // Insert after [features] line
-            lines.insert("hooks = true", at: featIdx + 1)
+            guard let existing = try? String(contentsOfFile: configPath, encoding: .utf8) else { return false }
+            contents = existing
         } else {
-            // No [features] section — append one
-            if !(lines.last ?? "").isEmpty { lines.append("") }
-            lines.append("[features]")
-            lines.append("hooks = true")
+            contents = ""
         }
-        let result = lines.joined(separator: "\n")
+        guard let result = CodexHooksConfig.enablingHooks(in: contents) else { return false }
+        if result == contents { return true }
         return ConfigPathIdentity.write(Data(result.utf8), to: configPath, fileManager: fm)
     }
 
@@ -2837,6 +3058,10 @@ struct ConfigInstaller {
             uninstallClineHooks(cli: cli, fm: fm)
             return
         }
+        if cli.format == .minimaxPlugin {
+            uninstallMinimaxHooks(cli: cli, fm: fm)
+            return
+        }
         if cli.format == .kimi {
             // Scrub modern + legacy homes; also honor absolute cli.fullPath
             // (hermetic tests / custom roots).
@@ -2968,6 +3193,9 @@ struct ConfigInstaller {
         if cli.format == .kimi {
             return isKimiHooksInstalled(cli: cli, fm: fm)
         }
+        if cli.format == .minimaxPlugin {
+            return isMinimaxPluginInstalled(cli: cli, fm: fm)
+        }
 
         guard let root = parseJSONFile(at: cli.fullPath, fm: fm),
               let hooks = root[cli.configKey] as? [String: Any] else { return false }
@@ -3017,6 +3245,9 @@ struct ConfigInstaller {
     private static func shouldPreservePartialHooks(for cli: CLIConfig, fm: FileManager) -> Bool {
         // Kimi stores hooks in TOML with its own all-or-nothing detection.
         if cli.format == .kimi { return false }
+        // The MiniMax plugin pack is generated whole and holds nothing but
+        // ours, so any drift is repaired rather than taken as a user's edit.
+        if cli.format == .minimaxPlugin { return false }
         guard let root = parseJSONFile(at: cli.fullPath, fm: fm),
               let hooks = root[cli.configKey] as? [String: Any] else { return false }
         // A legacy-shaped Antigravity model event is broken, not "intentionally

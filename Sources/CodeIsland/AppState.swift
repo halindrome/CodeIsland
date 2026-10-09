@@ -125,6 +125,14 @@ final class AppState {
     }
     var questionQueue: [QuestionRequest] = [] {
         didSet {
+            // A close lasts as long as its request: once answered, skipped or
+            // drained, its id is forgotten.
+            if !dismissedQuestionIds.isEmpty {
+                let queued = Set(questionQueue.map(\.id))
+                if !dismissedQuestionIds.isSubset(of: queued) {
+                    dismissedQuestionIds.formIntersection(queued)
+                }
+            }
             followUps.waitingChanged()
             PushNotifier.shared.requestsChanged()
         }
@@ -447,12 +455,39 @@ final class AppState {
         return ids
     }
 
-    /// Question counterpart of `visiblePermissionRequestIds`.
+    /// Question requests the user closed without answering. Unlike approvals
+    /// these are keyed by request, not session: a new question from the same
+    /// session is a new thing to see. Hidden, never resolved — the agent keeps
+    /// waiting, and the collapsed bar's question badge reopens the card.
+    private(set) var dismissedQuestionIds: Set<UUID> = [] {
+        didSet { followUps.waitingChanged() }
+    }
+
+    /// The question each session's card shows — its first queued one — in
+    /// queue order, for the sessions whose card the user has not closed. That
+    /// first question decides: a later one from the same session (a
+    /// subagent's) waits behind a closed card instead of reopening it on the
+    /// question the user just put away.
+    private var visibleQuestionCards: [QuestionRequest] {
+        var seen = Set<String>()
+        return questionQueue.filter { request in
+            seen.insert(request.event.sessionId ?? "default").inserted
+                && !dismissedQuestionIds.contains(request.id)
+        }
+    }
+
+    /// The first question whose card the user has not closed — what may open
+    /// by itself, and what a question shortcut acts on.
+    var nextVisibleQuestion: QuestionRequest? {
+        visibleQuestionCards.first
+    }
+
+    /// Question counterpart of `visiblePermissionRequestIds`: closed cards are
+    /// left out, so follow-up reminders stop for a card the user put away.
     var pendingQuestionRequestIds: [String: String] {
         var ids: [String: String] = [:]
-        for request in questionQueue {
-            let sid = request.event.sessionId ?? "default"
-            if ids[sid] == nil { ids[sid] = request.id.uuidString }
+        for request in visibleQuestionCards {
+            ids[request.event.sessionId ?? "default"] = request.id.uuidString
         }
         return ids
     }
@@ -1201,6 +1236,7 @@ final class AppState {
         case "pi":         return findPiPids(candidatePids: candidatePids)
         case "cline":      return findClinePids(candidatePids: candidatePids)
         case "zcode":      return findZcodePids(candidatePids: candidatePids)
+        case "minimax":    return findMinimaxPids(candidatePids: candidatePids)
         default:           return []
         }
     }
@@ -1400,7 +1436,8 @@ final class AppState {
     /// Session of a queued question the island is not showing — what the
     /// collapsed bar's question badge advertises and a click opens.
     var hiddenPendingQuestionSessionId: String? {
-        guard let head = questionQueue.first else { return nil }
+        // A question still waiting to be seen comes before one the user closed.
+        guard let head = nextVisibleQuestion ?? questionQueue.first else { return nil }
         if case .questionCard = surface { return nil }
         return head.event.sessionId ?? "default"
     }
@@ -1410,7 +1447,10 @@ final class AppState {
     /// auto-expand or Smart Suppress: those only decide what opens *by itself*.
     func openPendingQuestionCard(sessionId: String? = nil) {
         guard let sid = sessionId ?? hiddenPendingQuestionSessionId,
-              pendingQuestion(forSession: sid) != nil else { return }
+              let request = pendingQuestion(forSession: sid) else { return }
+        // Opening it again takes back a close: it is on screen, so it may
+        // stay up and remind like any other waiting question.
+        dismissedQuestionIds.remove(request.id)
         activeSessionId = sid
         withAnimation(NotchAnimation.open) {
             surface = .questionCard(sessionId: sid)
@@ -2402,7 +2442,10 @@ final class AppState {
         questionQueue.append(request)
         pushQuestionQueued(request, sessionId: sessionId, smartSuppressed: !shouldAutoOpenPendingSurface(for: sessionId))
 
-        if questionQueue.count == 1 {
+        // First of a burst: nothing else visibly waiting. Not `count == 1` —
+        // a closed question stays queued, and must not swallow every later
+        // question's card and sound (the trap #309 fixed for approvals).
+        if nextVisibleQuestion?.id == request.id {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion(), shouldAutoOpenPendingSurface(for: sessionId) {
                 withAnimation(NotchAnimation.open) {
@@ -2538,7 +2581,8 @@ final class AppState {
             )
         )
 
-        if questionQueue.count == 1 {
+        // First of a burst, as in `handleQuestion`.
+        if nextVisibleQuestion?.id == request.id {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion(), shouldAutoOpenQuestionSurface(for: event) {
                 withAnimation(NotchAnimation.open) {
@@ -2778,6 +2822,29 @@ final class AppState {
         return updatedInput
     }
 
+    /// Close a question card without answering it. The request stays queued
+    /// and the agent keeps waiting: answer it in the terminal, or reopen the
+    /// card from the collapsed bar's question badge. Skip, by contrast,
+    /// answers — for AskUserQuestion it denies the tool call.
+    func dismissQuestion(expectedSessionId: String? = nil) {
+        guard let index = questionIndex(expecting: expectedSessionId) else {
+            if let expectedSessionId {
+                discardStalePanelAction(expected: expectedSessionId, kind: "dismiss")
+            }
+            return
+        }
+        dismissedQuestionIds.insert(questionQueue[index].id)
+
+        if case .questionCard = surface {
+            withAnimation(NotchAnimation.close) {
+                surface = .collapsed
+            }
+        }
+        // Hand the panel to whatever is still visibly waiting, if it may open.
+        showNextPending()
+        refreshDerivedState()
+    }
+
     func skipQuestion(expectedSessionId: String? = nil) {
         guard let index = questionIndex(expecting: expectedSessionId) else {
             if let expectedSessionId {
@@ -2940,7 +3007,7 @@ final class AppState {
             }
             // The approval stays hidden; a card already up stays with it.
             if surface.approvalSessionId != nil || surface.questionSessionId != nil { return true }
-        } else if let next = questionQueue.first {
+        } else if let next = nextVisibleQuestion {
             hasPending = true
             // A question card still showing the question it was opened for
             // stays, even when it is not the head (the user clicked "Answer"
@@ -3364,6 +3431,7 @@ final class AppState {
             snapshot.herdrPaneId = p.herdrPaneId
             snapshot.herdrSocketPath = p.herdrSocketPath
             snapshot.herdrBinaryPath = p.herdrBinaryPath
+            snapshot.claudeDesktopSessionId = p.claudeDesktopSessionId
             snapshot.lastActivity = p.lastActivity
             snapshot.transcriptPath = p.transcriptPath
             snapshot.recap = p.recap
@@ -4621,6 +4689,7 @@ final class AppState {
                 child.herdrPaneId = child.herdrPaneId ?? parent.session.herdrPaneId
                 child.herdrSocketPath = child.herdrSocketPath ?? parent.session.herdrSocketPath
                 child.herdrBinaryPath = child.herdrBinaryPath ?? parent.session.herdrBinaryPath
+                child.claudeDesktopSessionId = child.claudeDesktopSessionId ?? parent.session.claudeDesktopSessionId
                 child.remoteHostId = child.remoteHostId ?? parent.session.remoteHostId
                 child.remoteHostName = child.remoteHostName ?? parent.session.remoteHostName
                 // Keep the child's own process identity only — the parent Cursor chat
@@ -5314,6 +5383,28 @@ final class AppState {
         (candidatePids ?? allProcessIds()).filter { pid in
             guard let path = executablePath(for: pid) else { return false }
             return CLIProcessResolver.sourceMatchesExecutablePath(path, source: "grok")
+        }
+    }
+
+    private nonisolated static func findMinimaxPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
+        // mcode is a Node script, so proc_pidpath is the node binary; the
+        // Node runtime renames its process title to `minimax-code`, which is
+        // what argv carries. Match whole arguments, not substrings: helpers
+        // mcode spawns in the session's cwd live under the same package
+        // (bundled ripgrep in .../@minimax-ai/code/node_modules/, the
+        // `mcode-tools` bin), and binding the card to one of those would end
+        // it when the helper exits.
+        (candidatePids ?? allProcessIds()).filter { pid in
+            getProcessArgs(pid).map(isMinimaxProcessArgs) ?? false
+        }
+    }
+
+    nonisolated static func isMinimaxProcessArgs(_ args: [String]) -> Bool {
+        args.contains { arg in
+            let lowered = arg.lowercased()
+            return lowered == "minimax-code"
+                || lowered.hasSuffix("/bin/mcode")
+                || lowered.hasSuffix("/@minimax-ai/code/cli.js")
         }
     }
 
@@ -7360,15 +7451,33 @@ final class AppState {
             return .unavailable
         }
 
-        guard let source = payload["source"] as? [String: Any],
-              let subagent = source["subagent"] as? [String: Any],
+        guard let source = payload["source"] as? [String: Any] else {
+            return .root
+        }
+        let payloadParent = (payload["parent_thread_id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        // Unit variants (`review`, `compact`, `memory_consolidation`) serialize as
+        // a bare string and only record their parent on the payload. Without
+        // one there is no spawn edge to fall back to either.
+        if let label = source["subagent"] as? String, !label.isEmpty {
+            guard let payloadParent else { return .root }
+            return .subagent(CodexSubagentMetadata(
+                parentThreadId: payloadParent,
+                agentType: label,
+                agentNickname: nil
+            ))
+        }
+        guard let subagent = source["subagent"] as? [String: Any],
               !subagent.isEmpty else {
             return .root
         }
+        // Spawned workers nest the parent under `source.subagent.thread_spawn`;
+        // auto-review (guardian) threads record it on the payload itself.
         let parent = firstStringRecursively(in: subagent, key: "parent_thread_id")
+            ?? payloadParent
         guard let parent, !parent.isEmpty else { return .unavailable }
 
         let agentType = firstStringRecursively(in: subagent, key: "agent_role")
+            ?? subagent["other"] as? String
             ?? subagent.keys.sorted().first
         let nickname = firstStringRecursively(in: subagent, key: "agent_nickname")
         return .subagent(CodexSubagentMetadata(
@@ -7978,6 +8087,21 @@ final class AppState {
     }
 
     /// Read model and last 3 user/assistant messages from a transcript file's tail
+    /// First text block of a transcript row worth showing, cleaned the way the
+    /// live tail cleans it (`JSONLTailer.extractText`): mcode's reasoning blobs
+    /// are skipped and leading injected wrappers removed, so a card rebuilt on
+    /// attach reads the same as one fed by the tailer.
+    nonisolated static func firstDisplayText(in blocks: [[String: Any]]) -> String? {
+        for block in blocks {
+            guard block["type"] as? String == "text",
+                  let raw = block["text"] as? String,
+                  !JSONLTailer.isThinkingBlob(raw) else { continue }
+            let text = JSONLTailer.stripDisplayWrappers(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return text }
+        }
+        return nil
+    }
+
     nonisolated static func readRecentFromTranscript(path: String) -> (String?, [ChatMessage]) {
         guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
         defer { handle.closeFile() }
@@ -8015,32 +8139,18 @@ final class AppState {
             var textContent: String?
             if normalizedRole == "user" || normalizedRole == "user_input" {
                 if let content = message["content"] as? String {
-                    var text = content
-                    if let startRange = text.range(of: "<USER_REQUEST>"),
-                       let endRange = text.range(of: "</USER_REQUEST>", range: startRange.upperBound..<text.endIndex) {
-                        text = String(text[startRange.upperBound..<endRange.lowerBound])
-                    }
-                    textContent = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    textContent = JSONLTailer.stripDisplayWrappers(content)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let contentArray = message["content"] as? [[String: Any]] {
-                    for item in contentArray {
-                        if item["type"] as? String == "text",
-                           let t = item["text"] as? String, !t.isEmpty {
-                            textContent = t
-                            break
-                        }
-                    }
+                    textContent = firstDisplayText(in: contentArray)
                 }
             } else if normalizedRole == "assistant" || normalizedRole == "planner_response" {
                 if let content = message["content"] as? String {
-                    textContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    textContent = JSONLTailer.isThinkingBlob(content)
+                        ? nil
+                        : content.trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let contentArray = message["content"] as? [[String: Any]] {
-                    for item in contentArray {
-                        if item["type"] as? String == "text",
-                           let t = item["text"] as? String, !t.isEmpty {
-                            textContent = t
-                            break
-                        }
-                    }
+                    textContent = firstDisplayText(in: contentArray)
                 } else if let thinking = message["thinking"] as? String {
                     textContent = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
                 }

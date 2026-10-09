@@ -108,6 +108,14 @@ struct TerminalActivator {
         if let sessionId, AppState.openCoworkSession(sessionKey: sessionId) {
             return
         }
+        // A Claude Code session run from Claude Desktop's Code tab: open that
+        // exact session. Raising the app alone left the user on whichever
+        // session it last showed.
+        if let hostId = session.claudeDesktopSessionId,
+           let url = ClaudeDesktopCodeSession.deepLinkURL(hostSessionId: hostId) {
+            AppState.openInClaudeDesktop(url)
+            return
+        }
         // A UI harness (T3 Code) owns the conversation: the terminal/multiplexer
         // env the CLI inherited belongs to wherever the harness server was
         // started, so jump to the harness instead — before Herdr/tmux routing,

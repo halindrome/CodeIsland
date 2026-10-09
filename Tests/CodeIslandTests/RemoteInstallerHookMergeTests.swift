@@ -150,6 +150,20 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
         XCTAssertTrue(cmds.contains { $0.contains("codeisland-remote-hook.py") }, "our hook missing: \(cmds)")
     }
 
+    func testCodexConfigFailureIsReportedWithoutChangingConfig() throws {
+        let root = sandboxHome.appendingPathComponent(".codex", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let config = root.appendingPathComponent("config.toml")
+        let original = "features = { hooks = false }\n"
+        try original.write(to: config, atomically: true, encoding: .utf8)
+
+        let status = try runConfigureScript()
+
+        XCTAssertTrue(status.contains("Codex config update failed"), status)
+        XCTAssertFalse(status.contains("Codex ok"), status)
+        XCTAssertEqual(try String(contentsOf: config, encoding: .utf8), original)
+    }
+
     func testCodeBuddyInstallPreservesUserHooks() throws {
         let userEntry: [String: Any] = [
             "matcher": "*",
@@ -217,6 +231,28 @@ final class RemoteInstallerHookMergeTests: XCTestCase {
             "SubagentStop", "UserPromptSubmit", "Stop", "Interrupt",
         ]
         XCTAssertEqual(Set(hooks.keys), expectedEvents)
+    }
+
+    /// Codex clamps SessionEnd / Interrupt hooks to 3 s and warns about any
+    /// longer timeout; a reconnect must also replace a stale 60 s entry.
+    func testCodexTeardownHooksStayWithinCodexTimeoutCap() throws {
+        let stale: [String: Any] = ["hooks": [[
+            "type": "command", "timeout": 60,
+            "command": "CODEISLAND_SOURCE=codex python3 ~/.codeisland/codeisland-remote-hook.py",
+        ]]]
+        try writeJSON(["hooks": ["Interrupt": [stale]]], to: ".codex/hooks.json")
+
+        try runConfigureScript()
+
+        let hooks = try XCTUnwrap(readJSON(".codex/hooks.json")["hooks"] as? [String: Any])
+        func timeouts(_ event: String) -> [Int] {
+            ((hooks[event] as? [[String: Any]]) ?? []).flatMap { entry in
+                ((entry["hooks"] as? [[String: Any]]) ?? []).compactMap { $0["timeout"] as? Int }
+            }
+        }
+        XCTAssertEqual(timeouts("SessionEnd"), [3])
+        XCTAssertEqual(timeouts("Interrupt"), [3])
+        XCTAssertEqual(timeouts("Stop"), [60])
     }
 
     func testQoderInstallIsIdempotentAcrossReconnects() throws {

@@ -605,6 +605,13 @@ if let orcaWorktree = env["ORCA_WORKTREE_ID"], !orcaWorktree.isEmpty {
     json["_orca_worktree_id"] = orcaWorktree
 }
 
+// Claude Desktop Code tab: Claude Desktop's own id for this session. The hook's
+// session_id is the CLI's id, which Claude Desktop's `claude://code/continue`
+// link does not accept; this one opens that exact session on click.
+if let host = env["CLAUDE_CODE_HOST_SESSION_ID"], !host.isEmpty {
+    json["_claude_desktop_session"] = host
+}
+
 // Inject cwd if not already present. Gemini CLI / Google Antigravity hooks do not
 // include a `cwd` field, so CodeIsland cannot resolve the project name and falls back
 // to "Session". Populating it here lets the approval card show the actual folder name.

@@ -60,16 +60,15 @@ final class MarkdownReplyViewTests: XCTestCase {
 
     private func replyMaxHeight(
         window: CGFloat = 510,
-        panel: CGFloat,
-        reply: CGFloat,
+        chrome: CGFloat?,
+        replies: Int = 1,
         maxVisibleSessions: Int = SettingsDefaults.maxVisibleSessions,
         maxPanelHeight: Int = SettingsDefaults.maxPanelHeight,
         minimum: CGFloat = 40
     ) -> CGFloat {
         CompletionReplyMetrics.maxHeight(
             windowHeight: window,
-            panelHeight: panel,
-            replyHeight: reply,
+            chrome: chrome.map { CompletionCardChrome(height: $0, replies: replies) },
             maxVisibleSessions: maxVisibleSessions,
             maxPanelHeight: maxPanelHeight,
             minimumHeight: minimum
@@ -80,17 +79,23 @@ final class MarkdownReplyViewTests: XCTestCase {
         let margin = CompletionReplyMetrics.bottomMargin
         // Card chrome measured at 230pt (notch 38, font 16, task progress,
         // "2 sessions" link…): the reply may use the other 280 − margin.
-        XCTAssertEqual(replyMaxHeight(panel: 230 + 300, reply: 300), 510 - 230 - margin)
-        // Stable once the reply takes that height: the chrome is the same.
-        XCTAssertEqual(replyMaxHeight(panel: 510 - margin, reply: 280 - margin), 510 - 230 - margin)
+        XCTAssertEqual(replyMaxHeight(chrome: 230), 510 - 230 - margin)
         // More chrome (an expanded task list, a recap) → less reply.
-        XCTAssertEqual(replyMaxHeight(panel: 330 + 100, reply: 100), 510 - 330 - margin)
+        XCTAssertEqual(replyMaxHeight(chrome: 330), 510 - 330 - margin)
         // The window is already clamped to the screen; a shorter one shrinks the reply.
-        XCTAssertEqual(replyMaxHeight(window: 400, panel: 230 + 50, reply: 50), 400 - 230 - margin)
+        XCTAssertEqual(replyMaxHeight(window: 400, chrome: 230), 400 - 230 - margin)
+    }
+
+    func testRepliesOnScreenTogetherShareTheRoom() {
+        // Each taking all of it, two replies counted each other as chrome
+        // and flipped between two heights for good (#357).
+        let room = 510 - 230 - CompletionReplyMetrics.bottomMargin
+        XCTAssertEqual(replyMaxHeight(chrome: 230, replies: 2), (room / 2).rounded(.down))
+        XCTAssertEqual(replyMaxHeight(chrome: 230, replies: 3), (room / 3).rounded(.down))
     }
 
     func testCompletionReplyStaysReadableWhenTheCardIsCrowded() {
-        XCTAssertEqual(replyMaxHeight(window: 300, panel: 290 + 60, reply: 60, minimum: 45), 45)
+        XCTAssertEqual(replyMaxHeight(window: 300, chrome: 290, minimum: 45), 45)
         XCTAssertEqual(
             CompletionReplyMetrics.minimumHeight(lineHeight: 14),
             42,
@@ -98,27 +103,59 @@ final class MarkdownReplyViewTests: XCTestCase {
         )
     }
 
+    @MainActor
     func testCompletionReplyFallsBackToAnEstimateUntilTheCardIsMeasured() {
         let estimate = 510 - CompletionReplyMetrics.estimatedChromeHeight - CompletionReplyMetrics.bottomMargin
         // Nothing measured yet — the window PanelWindowController asks for.
-        XCTAssertEqual(replyMaxHeight(window: 0, panel: 0, reply: 0), estimate)
-        // The reply is laid out but the panel still reports its collapsed
-        // height: a panel can't be shorter than the reply inside it.
-        XCTAssertEqual(replyMaxHeight(panel: 32, reply: 330), estimate)
+        XCTAssertEqual(replyMaxHeight(window: 0, chrome: nil), estimate)
+        // The collapsed bar or the session list says nothing about a reply's room.
+        let space = CompletionCardSpace()
+        space.recordChrome(CompletionCardChrome(height: 32, replies: 0))
+        XCTAssertNil(space.chrome)
+        space.recordChrome(CompletionCardChrome(height: 230, replies: 1))
+        space.recordChrome(CompletionCardChrome(height: 32, replies: 0))
+        XCTAssertEqual(space.chrome, CompletionCardChrome(height: 230, replies: 1))
     }
 
     func testMaxPanelHeightStillCapsATallWindow() {
         // "Unlimited" sessions: the window may be the whole screen; the
         // maxPanelHeight ceiling keeps an auto-opening card from covering it.
         XCTAssertEqual(
-            replyMaxHeight(window: 1100, panel: 200 + 100, reply: 100, maxVisibleSessions: 99, maxPanelHeight: 560),
+            replyMaxHeight(window: 1100, chrome: 200, maxVisibleSessions: 99, maxPanelHeight: 560),
             560 - 200 - CompletionReplyMetrics.bottomMargin
         )
         // An unset (0) ceiling leaves the window alone.
         XCTAssertEqual(
-            replyMaxHeight(window: 1100, panel: 200 + 100, reply: 100, maxPanelHeight: 0),
+            replyMaxHeight(window: 1100, chrome: 200, maxPanelHeight: 0),
             1100 - 200 - CompletionReplyMetrics.bottomMargin
         )
+    }
+
+    func testCardStopsRefittingWhenItRefitsTooOftenAndRecoversLater() {
+        var limiter = CompletionCardRefitLimiter()
+        let start: TimeInterval = 100
+        for i in 0..<CompletionCardRefitLimiter.maxRefits {
+            XCTAssertTrue(limiter.allows(at: start + Double(i) * 0.01))
+        }
+        XCTAssertFalse(limiter.allows(at: start + 0.5), "a loop's next re-fit is refused")
+        XCTAssertTrue(limiter.justTripped, "the first refusal is the one that gets logged")
+        XCTAssertFalse(limiter.allows(at: start + 0.6))
+        XCTAssertFalse(limiter.justTripped)
+        XCTAssertTrue(limiter.allows(at: start + 1.5), "a later change re-fits again")
+    }
+
+    @MainActor
+    func testATrippedCardKeepsItsChromeForTheRestOfTheWindow() {
+        let space = CompletionCardSpace()
+        for i in 0..<CompletionCardRefitLimiter.maxRefits {
+            space.recordChrome(CompletionCardChrome(height: CGFloat(200 + i), replies: 1), at: Double(i) * 0.01)
+        }
+        let held = space.chrome
+        let next = CompletionCardChrome(height: 400, replies: 2)
+        space.recordChrome(next, at: 0.5)
+        XCTAssertEqual(space.chrome, held, "past the limit every reply's cap stays where it is")
+        space.recordChrome(next, at: 1.5)
+        XCTAssertEqual(space.chrome, next, "a later window measures again")
     }
 
     func testOlderRepliesOnTheCompletionCardTakeOneOrTwoLines() {

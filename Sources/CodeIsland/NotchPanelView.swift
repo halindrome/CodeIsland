@@ -139,7 +139,7 @@ struct NotchPanelView: View {
     @State private var curtainOffset: CGFloat = 0
     @State private var curtainOpacity: Double = 1
     @State private var displayedToolStatus: Bool = SettingsDefaults.showToolStatus
-    /// Window and panel heights for the completion card's reply area.
+    /// Window height and card chrome for the completion card's reply area.
     @State private var cardSpace = CompletionCardSpace()
 
     private var isActive: Bool { !appState.sessions.isEmpty }
@@ -297,7 +297,8 @@ struct NotchPanelView: View {
                                 queueTotal: appState.questionQueue.count,
                                 onAnswer: { appState.answerQuestion($0, expectedSessionId: sid) },
                                 onAnswerMulti: { appState.answerQuestionMulti($0, expectedSessionId: sid) },
-                                onSkip: { appState.skipQuestion(expectedSessionId: sid) }
+                                onSkip: { appState.skipQuestion(expectedSessionId: sid) },
+                                onDismiss: { appState.dismissQuestion(expectedSessionId: sid) }
                             )
                             // One view per request. Answering a card promotes the
                             // next session's request into this same slot, and
@@ -322,7 +323,8 @@ struct NotchPanelView: View {
                                 queueTotal: 1,
                                 onAnswer: { _ in },
                                 onAnswerMulti: { _ in },
-                                onSkip: { }
+                                onSkip: { },
+                                onDismiss: { }
                             )
                             .transition(.blurFade.combined(with: .scale(scale: 0.96, anchor: .top)))
                         }
@@ -337,7 +339,7 @@ struct NotchPanelView: View {
                     }
                 }
             }
-            .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { cardSpace.recordPanelHeight($0) }
+            .recordsCompletionCardChrome(in: cardSpace)
             .frame(width: panelWidth)
             .clipped()
             .background(
@@ -1416,6 +1418,8 @@ private struct QuestionBar: View {
     let onAnswer: (String) -> Void
     let onAnswerMulti: ([AskUserQuestionAnswer]) -> Void
     let onSkip: () -> Void
+    /// Close the card without answering; the request keeps waiting.
+    let onDismiss: () -> Void
 
     @FocusState private var isFocused: Bool
 
@@ -1671,6 +1675,13 @@ private struct QuestionBar: View {
                 )
             }
             PixelButton(
+                label: L10n.shared["dismiss"],
+                fg: .white.opacity(0.6),
+                bg: Color.white.opacity(0.06),
+                border: Color.white.opacity(0.12),
+                action: onDismiss
+            )
+            PixelButton(
                 label: L10n.shared["skip"],
                 fg: .white.opacity(0.6),
                 bg: Color.white.opacity(0.06),
@@ -1845,6 +1856,13 @@ private struct QuestionBar: View {
         }
 
         HStack(spacing: 6) {
+            PixelButton(
+                label: L10n.shared["dismiss"],
+                fg: .white.opacity(0.6),
+                bg: Color.white.opacity(0.06),
+                border: Color.white.opacity(0.12),
+                action: onDismiss
+            )
             PixelButton(
                 label: L10n.shared["skip"],
                 fg: .white.opacity(0.6),
@@ -2023,8 +2041,12 @@ private struct SessionListView: View {
     @AppStorage(SettingsKey.showClaudeQuota) private var showClaudeQuota = SettingsDefaults.showClaudeQuota
 
     private var groupedSessions: [(header: String, source: String?, ids: [String])] {
-        if let only = onlySessionId, appState.sessions[only] != nil {
-            return [("", nil, [only])]
+        if let only = onlySessionId {
+            // A card whose session is gone shows nothing (the AiWork
+            // watchers drop sessions without moving the surface). Falling
+            // through would render every session as a completion card, and
+            // their replies size against each other without settling (#357).
+            return appState.sessions[only] != nil ? [("", nil, [only])] : []
         }
 
         let sorted = appState.sessions.keys.sorted()
@@ -2078,6 +2100,7 @@ private struct SessionListView: View {
                 ("kiro", "Kiro"),
                 ("cline", "Cline"),
                 ("zcode", "ZCode"),
+                ("minimax", "MiniMax Code CLI"),
                 ("aiwork", "AiWork"),
                 ("aiwork-cli", "AiWork CLI"),
             ]
@@ -3542,6 +3565,7 @@ private let cliIconFiles: [String: String] = [
     // MascotRenderHarness/testRenderCliIcons (MASCOT_ICON_DIR=…).
     "kiro": "kiro",
     "openclaw": "openclaw",
+    "minimax": "minimax",
 ]
 
 private var cliIconCache: [String: NSImage] = [:]

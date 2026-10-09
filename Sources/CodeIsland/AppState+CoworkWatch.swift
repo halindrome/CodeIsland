@@ -413,13 +413,20 @@ extension AppState {
     @discardableResult
     nonisolated static func openCoworkSession(sessionKey: String) -> Bool {
         guard let storeId = coworkStoreSessionId(fromKey: sessionKey) else { return false }
+        openInClaudeDesktop(CoworkSessionPolicy.deepLinkURL(sessionId: storeId))
+        return true
+    }
+
+    /// Bring Claude Desktop forward and, given a deep link, navigate it there.
+    /// Shared by Cowork cards and Code-tab sessions.
+    nonisolated static func openInClaudeDesktop(_ deepLink: URL?) {
         let workspace = NSWorkspace.shared
         if let app = NSRunningApplication.runningApplications(withBundleIdentifier: claudeDesktopBundleId).first,
            app.isHidden {
             app.unhide()
         }
         guard let appURL = workspace.urlForApplication(withBundleIdentifier: claudeDesktopBundleId) else {
-            return true
+            return
         }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
@@ -427,9 +434,8 @@ extension AppState {
         // main window (and switches Space). The link event queues behind it and
         // then navigates that window to the conversation.
         workspace.openApplication(at: appURL, configuration: configuration)
-        if let url = CoworkSessionPolicy.deepLinkURL(sessionId: storeId) {
-            workspace.open([url], withApplicationAt: appURL, configuration: configuration)
+        if let deepLink {
+            workspace.open([deepLink], withApplicationAt: appURL, configuration: configuration)
         }
-        return true
     }
 }

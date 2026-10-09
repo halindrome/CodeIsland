@@ -42,6 +42,7 @@ public struct SessionSnapshot: Sendable {
         "zcode",
         "aiwork",
         "aiwork-cli",
+        "minimax",
     ]
 
     /// Sources whose tool/description text arrives as a rapid delta stream
@@ -156,6 +157,10 @@ public struct SessionSnapshot: Sendable {
     /// Claude Agent Teams sessions), which is what used to send click-to-jump
     /// to a blank Terminal.app window.
     public var orcaWorktreeId: String?
+    /// Claude Desktop's own id for a Code-tab session (`local_…`, from
+    /// CLAUDE_CODE_HOST_SESSION_ID) — what its `claude://code/continue` link
+    /// takes to open that exact session instead of just raising the app.
+    public var claudeDesktopSessionId: String?
     public var cliPid: pid_t?            // CLI process PID (from bridge _ppid)
     public var cliStartTime: Date?       // Start time of the tracked CLI PID (guards PID reuse)
     /// UI harness (T3 Code, …) that spawned the CLI, found by walking the
@@ -345,6 +350,15 @@ public struct SessionSnapshot: Sendable {
             "oh my pi": "pi",
             "z-code": "zcode",
             "z code": "zcode",
+            // MiniMax Code CLI — the executable is `mcode` (npm @minimax-ai/code)
+            // and the Node runtime renames the process title to `minimax-code`,
+            // so both spellings (and the product name) normalize onto `minimax`.
+            "mcode": "minimax",
+            "minimax-code": "minimax",
+            "minimaxcode": "minimax",
+            "minimax-cli": "minimax",
+            "minimaxcli": "minimax",
+            "minimax-code-cli": "minimax",
         ]
         let canonical = aliases[normalized] ?? normalized
         let dynamicSupportedSources = supportedSources.union(loadCustomSources())
@@ -362,6 +376,7 @@ public struct SessionSnapshot: Sendable {
         if canonical.hasPrefix("qwen") { return "qwen" }
         if canonical.hasPrefix("kiro") { return "kiro" }
         if canonical.hasPrefix("kimi") { return "kimi" }
+        if canonical.hasPrefix("minimax") { return "minimax" }
         if canonical.hasPrefix("codybuddycn") || canonical.hasPrefix("codebuddycn") { return "codybuddycn" }
         if canonical.hasPrefix("stepfun") { return "stepfun" }
         if canonical.hasPrefix("traecn") { return "traecn" }
@@ -684,6 +699,7 @@ public struct SessionSnapshot: Sendable {
         case "zcode": return "ZCode"
         case "aiwork": return "AiWork"
         case "aiwork-cli": return "AiWork CLI"
+        case "minimax": return "MiniMax Code CLI"
         default:
             if let customName = Self.loadCustomSourceNames()[source] {
                 return customName
@@ -1302,7 +1318,18 @@ public func reduceEvent(
         )
         if let msg = assistantMsg {
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // Stop's last_assistant_message (Claude Code, Codex, mcode, …) is
+            // often the reply the transcript tailer already appended, and with
+            // maxCount 3 a duplicate crowds a real row off the card. Skip it
+            // only when that reply is the newest row: after a new prompt, the
+            // same text is a new answer and still lands.
+            let normalizedIncoming = JSONLTailer.normalizedCursorChatText(from: msg) ?? msg
+            let alreadyShown = sessions[sessionId]?.recentMessages.last.map {
+                !$0.isUser && (JSONLTailer.normalizedCursorChatText(from: $0.text) ?? $0.text) == normalizedIncoming
+            } ?? false
+            if !alreadyShown {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
             // No reply content from hook (e.g. CodeBuddy) -- add placeholder
@@ -1395,6 +1422,9 @@ public func reduceEvent(
         }
         if let supersetPane = event.rawJSON["_superset_pane_id"] as? String, !supersetPane.isEmpty {
             sessions[sessionId]?.supersetPaneId = supersetPane
+        }
+        if let hostId = claudeDesktopSessionId(in: event) {
+            sessions[sessionId]?.claudeDesktopSessionId = hostId
         }
         if let env = event.rawJSON["_env"] as? [String: String] {
             applyEnvMetadata(into: &sessions, sessionId: sessionId, env: env)
@@ -1578,6 +1608,11 @@ private func applyEnvMetadata(into sessions: inout [String: SessionSnapshot], se
        let worktree = env["ORCA_WORKTREE_ID"], !worktree.isEmpty {
         sessions[sessionId]?.orcaWorktreeId = worktree
     }
+    if sessions[sessionId]?.claudeDesktopSessionId == nil,
+       let host = env[ClaudeDesktopCodeSession.hostSessionEnvKey],
+       ClaudeDesktopCodeSession.isValidHostSessionId(host) {
+        sessions[sessionId]?.claudeDesktopSessionId = host
+    }
 }
 
 /// Fill identity fields on a parent card from a merged Task/subagent hook.
@@ -1649,6 +1684,20 @@ public func fillMissingParentMetadataFromSubagentEvent(
        let binary = event.rawJSON["_herdr_bin_path"] as? String, !binary.isEmpty {
         sessions[sessionId]?.herdrBinaryPath = binary
     }
+    // A subagent runs inside the parent's CLI, so it carries the same id.
+    if sessions[sessionId]?.claudeDesktopSessionId == nil,
+       let hostId = claudeDesktopSessionId(in: event) {
+        sessions[sessionId]?.claudeDesktopSessionId = hostId
+    }
+}
+
+/// The Claude Desktop Code-tab id the bridge forwarded from
+/// CLAUDE_CODE_HOST_SESSION_ID. Only a well-formed id is kept: it ends up in
+/// a URL on click.
+private func claudeDesktopSessionId(in event: HookEvent) -> String? {
+    guard let hostId = event.rawJSON["_claude_desktop_session"] as? String,
+          ClaudeDesktopCodeSession.isValidHostSessionId(hostId) else { return nil }
+    return hostId
 }
 
 private func shouldReopenCursorSubagentOnPrompt(event: HookEvent, session: SessionSnapshot?) -> Bool {
@@ -1816,6 +1865,11 @@ public func extractMetadata(into sessions: inout [String: SessionSnapshot], sess
     }
     if let orcaWorktree = event.rawJSON["_orca_worktree_id"] as? String, !orcaWorktree.isEmpty {
         sessions[sessionId]?.orcaWorktreeId = orcaWorktree
+    }
+    // Claude Desktop Code-tab session id (injected by bridge from
+    // CLAUDE_CODE_HOST_SESSION_ID).
+    if let hostId = claudeDesktopSessionId(in: event) {
+        sessions[sessionId]?.claudeDesktopSessionId = hostId
     }
     if let remoteHostId = event.rawJSON["_remote_host_id"] as? String, !remoteHostId.isEmpty {
         sessions[sessionId]?.remoteHostId = remoteHostId

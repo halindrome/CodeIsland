@@ -36,12 +36,124 @@ struct CodexPermissionRules {
             return isAutoReviewReviewer(reviewer)
         }
 
+        // Desktop selections and per-turn overrides need not be written to
+        // config.toml or included in PermissionRequest. The matching rollout
+        // turn_context records the effective reviewer, including an explicit
+        // switch back to human review, so it takes precedence over config.
+        if let reviewer = transcriptReviewerValue(event.rawJSON) {
+            return isAutoReviewReviewer(reviewer)
+        }
+
         let configPath = codexHome(for: event) + "/config.toml"
         guard fileManager.fileExists(atPath: configPath),
               let contents = try? String(contentsOfFile: configPath, encoding: .utf8) else {
             return false
         }
         return configEnablesAutoReview(contents)
+    }
+
+    /// The reviewer recorded by the rollout's newest `turn_context`, when that
+    /// context belongs to the hook's turn.
+    ///
+    /// Codex runs one turn at a time per thread and writes the turn's context
+    /// before its first model request, so the newest context is the only one
+    /// that can describe the turn now asking. An older one, or a newest one that
+    /// omits the reviewer, must not lend its value.
+    ///
+    /// This runs on the main actor for every Codex PermissionRequest. A long
+    /// turn can sit tens of MiB past its context (local rollouts show 1 in 8
+    /// turns over 4 MiB), so the file is searched backwards in chunks for the
+    /// marker instead of being split into lines: the usual case costs one chunk,
+    /// a miss across the whole window ~10 ms.
+    static func transcriptReviewerValue(
+        _ rawJSON: [String: Any],
+        maxBytes: Int = 32 * 1024 * 1024,
+        chunkBytes: Int = 256 * 1024
+    ) -> String? {
+        // A remote rollout path belongs to the SSH host, not this Mac.
+        guard rawJSON["_remote_host_id"] == nil,
+              let turnId = rawJSON["turn_id"] as? String, !turnId.isEmpty,
+              let path = rawJSON["transcript_path"] as? String, !path.isEmpty,
+              let payload = latestTurnContextPayload(atPath: path, maxBytes: maxBytes, chunkBytes: chunkBytes),
+              payload["turn_id"] as? String == turnId else { return nil }
+        return eventReviewerValue(payload)
+    }
+
+    private static let turnContextMarker = Data(#""turn_context""#.utf8)
+    /// A turn_context line is a few KiB; anything longer is some other record.
+    private static let turnContextLineLimit: UInt64 = 64 * 1024
+
+    private static func latestTurnContextPayload(atPath path: String, maxBytes: Int, chunkBytes: Int) -> [String: Any]? {
+        guard maxBytes > 0, chunkBytes > 0,
+              let handle = FileHandle(forReadingAtPath: path) else { return nil }
+        defer { try? handle.close() }
+
+        let marker = turnContextMarker
+        do {
+            let end = try handle.seekToEnd()
+            let floor = end - min(end, UInt64(maxBytes))
+            var upper = end
+            while upper > floor {
+                let lower = upper - min(upper - floor, UInt64(chunkBytes))
+                // Overlap the next chunk so a marker split across the boundary is seen whole.
+                let readEnd = min(end, upper + UInt64(marker.count - 1))
+                try handle.seek(toOffset: lower)
+                guard let chunk = try handle.read(upToCount: Int(readEnd - lower)) else { return nil }
+                var searchEnd = chunk.endIndex
+                while let hit = chunk.range(of: marker, options: .backwards, in: chunk.startIndex..<searchEnd) {
+                    searchEnd = hit.lowerBound
+                    let offset = lower + UInt64(hit.lowerBound - chunk.startIndex)
+                    // Starts inside the overlap: already seen with the later chunk.
+                    guard offset < upper else { continue }
+                    if let payload = try turnContextPayload(handle: handle, around: offset, floor: floor, end: end) {
+                        return payload
+                    }
+                }
+                upper = lower
+            }
+        } catch {
+            // Missing/unreadable/rotated rollouts retain the config fallback.
+        }
+        return nil
+    }
+
+    /// Decodes the line holding the marker at `offset`, provided the whole line
+    /// lies inside the window: a line cut by the window's start could begin in
+    /// the middle of JSON or UTF-8, and one still being written is incomplete.
+    private static func turnContextPayload(
+        handle: FileHandle,
+        around offset: UInt64,
+        floor: UInt64,
+        end: UInt64
+    ) throws -> [String: Any]? {
+        let start = offset - min(offset - floor, turnContextLineLimit)
+        let stop = min(end, offset + turnContextLineLimit)
+        try handle.seek(toOffset: start)
+        // A rollout rewritten since the chunk was read can come back short.
+        guard let data = try handle.read(upToCount: Int(stop - start)),
+              Int(offset - start) < data.count else { return nil }
+        let hit = data.startIndex + Int(offset - start)
+
+        let lineStart: Data.Index
+        if let newline = data[..<hit].lastIndex(of: 0x0A) {
+            lineStart = newline + 1
+        } else if start == 0 {
+            lineStart = data.startIndex
+        } else {
+            return nil
+        }
+        let lineEnd: Data.Index
+        if let newline = data[hit...].firstIndex(of: 0x0A) {
+            lineEnd = newline
+        } else if stop == end {
+            lineEnd = data.endIndex
+        } else {
+            return nil
+        }
+
+        guard let record = try? JSONSerialization.jsonObject(with: data[lineStart..<lineEnd]) as? [String: Any],
+              record["type"] as? String == "turn_context" else { return nil }
+        return record["payload"] as? [String: Any]
     }
 
     static func configEnablesAutoReview(_ contents: String) -> Bool {

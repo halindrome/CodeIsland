@@ -346,7 +346,8 @@ extension AppState {
         questionQueue.append(request)
         pushQuestionQueued(request, sessionId: sessionId, smartSuppressed: false)
 
-        if questionQueue.count == 1 {
+        // First of a burst, as in `handleQuestion`.
+        if nextVisibleQuestion?.id == request.id {
             activeSessionId = sessionId
             if Self.autoExpandOnQuestion() {
                 withAnimation(NotchAnimation.open) {
