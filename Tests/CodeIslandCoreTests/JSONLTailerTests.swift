@@ -637,6 +637,68 @@ final class JSONLTailerTests: XCTestCase {
         XCTAssertEqual(exact.delta.lastUserPrompt, "in window")
     }
 
+    // MARK: - MiniMax compatible-transcript shapes
+
+    func testScanLinesStripsMinimaxSystemReminderFromUserPrompt() {
+        // mcode prepends its agent-context boilerplate to the prompt inside
+        // the SAME text block of the compatible transcript's user row.
+        let wrapped = "<system-reminder>\n<agent-context>\n  agent: Mavis\n</agent-context>\n</system-reminder>\n\n你好"
+        let payload: [String: Any] = [
+            "type": "user",
+            "message": ["content": [["type": "text", "text": wrapped]]],
+        ]
+        let result = JSONLTailer.scanLines(Data((jsonString(payload) + "\n").utf8))
+        XCTAssertEqual(result.delta.lastUserPrompt, "你好")
+    }
+
+    func testScanLinesSkipsMinimaxThinkingBlobTextBlock() {
+        // mcode's compatible export disguises the reasoning pass as a TEXT
+        // block holding a {"type":"thinking",…} JSON string; only the public
+        // reply may reach the card.
+        let blob = #"{"type":"thinking","thinking":"The user greeted me in Chinese","thinkingSignature":"b1f92541"}"#
+        let payload: [String: Any] = [
+            "type": "assistant",
+            "message": ["content": [
+                ["type": "text", "text": blob],
+                ["type": "text", "text": "你好！有什么我可以帮你的吗？"],
+            ]],
+        ]
+        let result = JSONLTailer.scanLines(Data((jsonString(payload) + "\n").utf8))
+        XCTAssertEqual(result.delta.lastAssistantMessage, "你好！有什么我可以帮你的吗？")
+    }
+
+    func testScanLinesThinkingBlobOnlyAssistantRowYieldsNoReply() {
+        let blob = #"{"type":"thinking","thinking":"mid-reasoning"}"#
+        let payload: [String: Any] = [
+            "type": "assistant",
+            "message": ["content": [["type": "text", "text": blob]]],
+        ]
+        let result = JSONLTailer.scanLines(Data((jsonString(payload) + "\n").utf8))
+        XCTAssertNil(result.delta.lastAssistantMessage)
+    }
+
+    func testExtractTextDropsThinkingBlobStringContent() {
+        let blob = #"{"type":"thinking","thinking":"not display text"}"#
+        XCTAssertNil(JSONLTailer.extractText(from: blob))
+        XCTAssertNil(JSONLTailer.extractText(from: "  \(blob)  "))
+        XCTAssertEqual(JSONLTailer.extractText(from: "plain reply"), "plain reply")
+    }
+
+    func testExtractTextKeepsASystemReminderTagQuotedInsideTheMessage() {
+        // extractText feeds every Claude-format source. Only an injected span
+        // that opens the text is a wrapper; a reply (or prompt) that talks
+        // about the tag keeps every word.
+        let reply = "Claude Code wraps hook output in <system-reminder>like this</system-reminder> before the model sees it."
+        XCTAssertEqual(JSONLTailer.extractText(from: reply), reply)
+        XCTAssertEqual(JSONLTailer.extractText(from: [["type": "text", "text": reply]]), reply)
+
+        // Several leading spans all go; the typed text after them stays.
+        let wrapped = "<system-reminder>a</system-reminder>\n<system-reminder>b</system-reminder>\nwhat is <system-reminder>?"
+        XCTAssertEqual(JSONLTailer.extractText(from: wrapped), "what is <system-reminder>?")
+        // An unclosed leading tag is not a wrapper we can bound — leave it.
+        XCTAssertEqual(JSONLTailer.extractText(from: "<system-reminder> what is this tag"), "<system-reminder> what is this tag")
+    }
+
     // MARK: - Fixtures
 
     private func assistantLine(text: String) -> String {

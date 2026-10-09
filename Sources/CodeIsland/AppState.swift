@@ -1236,6 +1236,7 @@ final class AppState {
         case "pi":         return findPiPids(candidatePids: candidatePids)
         case "cline":      return findClinePids(candidatePids: candidatePids)
         case "zcode":      return findZcodePids(candidatePids: candidatePids)
+        case "minimax":    return findMinimaxPids(candidatePids: candidatePids)
         default:           return []
         }
     }
@@ -5385,6 +5386,28 @@ final class AppState {
         }
     }
 
+    private nonisolated static func findMinimaxPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
+        // mcode is a Node script, so proc_pidpath is the node binary; the
+        // Node runtime renames its process title to `minimax-code`, which is
+        // what argv carries. Match whole arguments, not substrings: helpers
+        // mcode spawns in the session's cwd live under the same package
+        // (bundled ripgrep in .../@minimax-ai/code/node_modules/, the
+        // `mcode-tools` bin), and binding the card to one of those would end
+        // it when the helper exits.
+        (candidatePids ?? allProcessIds()).filter { pid in
+            getProcessArgs(pid).map(isMinimaxProcessArgs) ?? false
+        }
+    }
+
+    nonisolated static func isMinimaxProcessArgs(_ args: [String]) -> Bool {
+        args.contains { arg in
+            let lowered = arg.lowercased()
+            return lowered == "minimax-code"
+                || lowered.hasSuffix("/bin/mcode")
+                || lowered.hasSuffix("/@minimax-ai/code/cli.js")
+        }
+    }
+
     private nonisolated static func findPiPids(candidatePids: [pid_t]? = nil) -> [pid_t] {
         findPids(
             matchingPathSubstrings: [
@@ -8064,6 +8087,21 @@ final class AppState {
     }
 
     /// Read model and last 3 user/assistant messages from a transcript file's tail
+    /// First text block of a transcript row worth showing, cleaned the way the
+    /// live tail cleans it (`JSONLTailer.extractText`): mcode's reasoning blobs
+    /// are skipped and leading injected wrappers removed, so a card rebuilt on
+    /// attach reads the same as one fed by the tailer.
+    nonisolated static func firstDisplayText(in blocks: [[String: Any]]) -> String? {
+        for block in blocks {
+            guard block["type"] as? String == "text",
+                  let raw = block["text"] as? String,
+                  !JSONLTailer.isThinkingBlob(raw) else { continue }
+            let text = JSONLTailer.stripDisplayWrappers(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { return text }
+        }
+        return nil
+    }
+
     nonisolated static func readRecentFromTranscript(path: String) -> (String?, [ChatMessage]) {
         guard let handle = FileHandle(forReadingAtPath: path) else { return (nil, []) }
         defer { handle.closeFile() }
@@ -8101,32 +8139,18 @@ final class AppState {
             var textContent: String?
             if normalizedRole == "user" || normalizedRole == "user_input" {
                 if let content = message["content"] as? String {
-                    var text = content
-                    if let startRange = text.range(of: "<USER_REQUEST>"),
-                       let endRange = text.range(of: "</USER_REQUEST>", range: startRange.upperBound..<text.endIndex) {
-                        text = String(text[startRange.upperBound..<endRange.lowerBound])
-                    }
-                    textContent = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    textContent = JSONLTailer.stripDisplayWrappers(content)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let contentArray = message["content"] as? [[String: Any]] {
-                    for item in contentArray {
-                        if item["type"] as? String == "text",
-                           let t = item["text"] as? String, !t.isEmpty {
-                            textContent = t
-                            break
-                        }
-                    }
+                    textContent = firstDisplayText(in: contentArray)
                 }
             } else if normalizedRole == "assistant" || normalizedRole == "planner_response" {
                 if let content = message["content"] as? String {
-                    textContent = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                    textContent = JSONLTailer.isThinkingBlob(content)
+                        ? nil
+                        : content.trimmingCharacters(in: .whitespacesAndNewlines)
                 } else if let contentArray = message["content"] as? [[String: Any]] {
-                    for item in contentArray {
-                        if item["type"] as? String == "text",
-                           let t = item["text"] as? String, !t.isEmpty {
-                            textContent = t
-                            break
-                        }
-                    }
+                    textContent = firstDisplayText(in: contentArray)
                 } else if let thinking = message["thinking"] as? String {
                     textContent = thinking.trimmingCharacters(in: .whitespacesAndNewlines)
                 }

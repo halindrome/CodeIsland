@@ -42,6 +42,7 @@ public struct SessionSnapshot: Sendable {
         "zcode",
         "aiwork",
         "aiwork-cli",
+        "minimax",
     ]
 
     /// Sources whose tool/description text arrives as a rapid delta stream
@@ -349,6 +350,15 @@ public struct SessionSnapshot: Sendable {
             "oh my pi": "pi",
             "z-code": "zcode",
             "z code": "zcode",
+            // MiniMax Code CLI — the executable is `mcode` (npm @minimax-ai/code)
+            // and the Node runtime renames the process title to `minimax-code`,
+            // so both spellings (and the product name) normalize onto `minimax`.
+            "mcode": "minimax",
+            "minimax-code": "minimax",
+            "minimaxcode": "minimax",
+            "minimax-cli": "minimax",
+            "minimaxcli": "minimax",
+            "minimax-code-cli": "minimax",
         ]
         let canonical = aliases[normalized] ?? normalized
         let dynamicSupportedSources = supportedSources.union(loadCustomSources())
@@ -366,6 +376,7 @@ public struct SessionSnapshot: Sendable {
         if canonical.hasPrefix("qwen") { return "qwen" }
         if canonical.hasPrefix("kiro") { return "kiro" }
         if canonical.hasPrefix("kimi") { return "kimi" }
+        if canonical.hasPrefix("minimax") { return "minimax" }
         if canonical.hasPrefix("codybuddycn") || canonical.hasPrefix("codebuddycn") { return "codybuddycn" }
         if canonical.hasPrefix("stepfun") { return "stepfun" }
         if canonical.hasPrefix("traecn") { return "traecn" }
@@ -688,6 +699,7 @@ public struct SessionSnapshot: Sendable {
         case "zcode": return "ZCode"
         case "aiwork": return "AiWork"
         case "aiwork-cli": return "AiWork CLI"
+        case "minimax": return "MiniMax Code CLI"
         default:
             if let customName = Self.loadCustomSourceNames()[source] {
                 return customName
@@ -1306,7 +1318,18 @@ public func reduceEvent(
         )
         if let msg = assistantMsg {
             sessions[sessionId]?.lastAssistantMessage = msg
-            sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            // Stop's last_assistant_message (Claude Code, Codex, mcode, …) is
+            // often the reply the transcript tailer already appended, and with
+            // maxCount 3 a duplicate crowds a real row off the card. Skip it
+            // only when that reply is the newest row: after a new prompt, the
+            // same text is a new answer and still lands.
+            let normalizedIncoming = JSONLTailer.normalizedCursorChatText(from: msg) ?? msg
+            let alreadyShown = sessions[sessionId]?.recentMessages.last.map {
+                !$0.isUser && (JSONLTailer.normalizedCursorChatText(from: $0.text) ?? $0.text) == normalizedIncoming
+            } ?? false
+            if !alreadyShown {
+                sessions[sessionId]?.addRecentMessage(ChatMessage(isUser: false, text: msg))
+            }
         } else if sessions[sessionId]?.lastAssistantMessage == nil,
                   sessions[sessionId]?.recentMessages.last?.isUser == true {
             // No reply content from hook (e.g. CodeBuddy) -- add placeholder
